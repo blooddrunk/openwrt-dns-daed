@@ -1,0 +1,8 @@
+FAKE-SQLITE-HEADER (text stand-in for /etc/daed/wing.db)
+dns: upstream alidns='https://dns.alidns.com/dns-query' googledns='https://dns.google/dns-query'
+dns: routing qname(geosite:cn) -> alidns, fallback: googledns
+routing: pname(dnsmasq, https-dns-proxy) -> must_direct
+routing: dip(203.0.113.10/32) && l4proto(tcp) && dport(33973) -> must_direct
+routing: dip(203.0.113.10/32) && l4proto(udp) && dport(50757) -> must_direct
+routing: dip(198.51.100.20/32) && l4proto(tcp) && dport(12142) -> must_direct
+group: proxy premium

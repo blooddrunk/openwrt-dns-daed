@@ -1,0 +1,11 @@
+table inet fw4 {
+	chain dstnat_lan {
+		type nat hook dstnat priority -100; policy accept;
+		udp dport 53 redirect to :53 comment "ubus:https-dns-proxy DNS hijack"
+		tcp dport 53 redirect to :53 comment "ubus:https-dns-proxy DNS hijack"
+	}
+	chain forward_lan {
+		tcp dport 853 reject
+		udp dport 853 reject
+	}
+}

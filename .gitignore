@@ -1,0 +1,12 @@
+# 测试沙箱与临时产物
+tests/.sandbox/
+tests/.dbg/
+*.log
+
+# 编辑器/系统
+.DS_Store
+*.swp
+*~
+
+# 本地个性化配置（避免误提交真实节点/公司域名）
+local*.conf

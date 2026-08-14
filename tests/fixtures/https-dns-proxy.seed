@@ -1,0 +1,15 @@
+config main 'config'
+	option force_dns '1'
+	option notrack_dns '1'
+	list force_dns_port '53'
+	list force_dns_src_interface 'lan'
+
+config https-dns-proxy
+	option resolver_url 'https://dns.alidns.com/dns-query'
+	option bootstrap_dns '223.5.5.5'
+	option listen_port '5053'
+
+config https-dns-proxy
+	option resolver_url 'https://dns.alidns.com/dns-query'
+	option bootstrap_dns '223.5.5.5'
+	option listen_port '5054'

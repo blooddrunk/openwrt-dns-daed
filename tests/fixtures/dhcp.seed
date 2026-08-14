@@ -1,0 +1,12 @@
+config dnsmasq
+	option domainneeded '1'
+	option noresolv '0'
+	option dns_redirect '1'
+	list server '127.0.0.1#5053'
+	list server '127.0.0.1#5054'
+	list server '127.0.0.1#5055'
+	list server '223.5.5.5'
+	list server '/use-application-dns.net/'
+	list doh_server '127.0.0.1#5054'
+	list doh_server '127.0.0.1#5055'
+	list doh_backup_server '127.0.0.1#5054'

@@ -1,0 +1,6 @@
+table inet fw4 {
+	chain dstnat_lan {
+		type nat hook dstnat priority -100; policy accept;
+		meta l4proto { tcp, udp } th dport 53 counter packets 10 redirect to :53 comment "DNSMASQ HIJACK"
+	}
+}

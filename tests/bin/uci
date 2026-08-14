@@ -1,0 +1,295 @@
+#!/bin/sh
+# =============================================================================
+# tests/bin/uci —— OpenWrt uci 命令的最小可测替身（仅测试沙箱使用）
+#
+# 实现子集: show / get / set / add / add_list / del_list / delete /
+#           import / export / commit
+# 环境变量:
+#   UCI_STATE  状态文件（必需；持久化，跨调用保留）
+#   UCI_CALLS  变更调用日志（可选；追加记录每次 set/add/del/import/commit）
+#
+# 状态行格式（内部）:
+#   <config>.<sec>=<TYPE>              配置节；匿名节 sec 形如 anon:1
+#   <config>.<sec>.<opt> OPT <value>   普通选项
+#   <config>.<sec>.<opt> LIST <v...>   列表选项（值不含空格）
+# =============================================================================
+
+STATE="${UCI_STATE:?UCI_STATE 未设置}"
+CALLS="${UCI_CALLS:-}"
+[ -f "$STATE" ] || : > "$STATE"
+
+log_call() { [ -n "$CALLS" ] && echo "$*" >> "$CALLS"; return 0; }
+
+state_lines() { cat "$STATE" 2>/dev/null; }
+
+strip_quotes() { printf '%s' "$1" | sed "s/^'//; s/'$//"; }
+
+# 取某 config 下指定 TYPE 的全部内部 sec id（按插入顺序，每行一个）
+sections_of_type() { # config type
+    state_lines | grep "^$1\.[^=]*=$2$" | cut -d= -f1 | sed "s/^$1\.//"
+}
+
+next_anon_id() {
+    n=$(state_lines | grep -oE "anon:[0-9]+" | sed 's/anon://' | sort -n | tail -n 1)
+    echo $(( ${n:-0} + 1 ))
+}
+
+sec_type() { # config sec -> 节类型
+    state_lines | sed -n "s/^$1\.$2=\(.*\)$/\1/p"
+}
+
+# 解析 @type[idx] / 命名节 表达式 -> 内部 sec id；失败 rc=1
+resolve_sec() { # config sec_expr
+    cfg="$1"; expr="$2"
+    case "$expr" in
+        @*)
+            type=$(printf '%s' "$expr" | sed 's/^@//; s/\[.*//')
+            idx=$(printf '%s' "$expr" | sed -n 's/.*\[\(-\{0,1\}[0-9]\{1,\}\)\]$/\1/p')
+            [ -n "$idx" ] || return 1
+            ids=$(sections_of_type "$cfg" "$type")
+            total=$(printf '%s\n' "$ids" | grep -c .)
+            [ "$total" -gt 0 ] || return 1
+            if [ "$idx" -lt 0 ]; then pos=$((total + idx + 1)); else pos=$((idx + 1)); fi
+            [ "$pos" -ge 1 ] && [ "$pos" -le "$total" ] || return 1
+            printf '%s\n' "$ids" | sed -n "${pos}p"
+            ;;
+        *)
+            state_lines | grep -q "^${cfg}\.${expr}=" || return 1
+            echo "$expr"
+            ;;
+    esac
+}
+
+# 渲染 show 输出（可限定单个内部 sec）；匿名节渲染为 @type[idx]
+render_show() { # config [want_sec]
+    cfg="$1"; want_sec="$2"
+    for line in $(state_lines | grep "^${cfg}\.[^=]*=" | cut -d= -f1); do
+        sec=${line#*.}
+        [ -z "$want_sec" ] || [ "$sec" = "$want_sec" ] || continue
+        type=$(sec_type "$cfg" "$sec")
+        case "$sec" in
+            anon:*)
+                idx=$(sections_of_type "$cfg" "$type" | grep -n "^${sec}$" | cut -d: -f1)
+                disp="${cfg}.@${type}[$((idx - 1))]"
+                ;;
+            *)  disp="${cfg}.${sec}" ;;
+        esac
+        echo "${disp}=${type}"
+        state_lines | grep "^${cfg}\.${sec}\.[^ ]* " | while IFS= read -r oline; do
+            key=${oline%% *}
+            kindval=${oline#* }
+            kind=${kindval%% *}
+            vals=${kindval#* }
+            case "$kind" in
+                OPT) echo "${disp}.${key##*.}='$(printf '%s' "$vals" | sed "s/'/'\\\\''/g")'" ;;
+                LIST)
+                    out=""
+                    for v in $vals; do
+                        if [ -z "$out" ]; then out="'${v}'"; else out="${out} '${v}'"; fi
+                    done
+                    echo "${disp}.${key##*.}=${out}"
+                    ;;
+            esac
+        done
+    done
+}
+
+sec_exists() { state_lines | grep -q "^$1\.$2="; }
+
+opt_line() { # config sec opt -> 该状态行（含 OPT/LIST 标记），无则 rc=1
+    state_lines | grep "^$1\.$2\.$3 " | head -n 1
+}
+
+remove_lines_matching() { # regex
+    grep -v "$1" "$STATE" > "${STATE}.tmp" 2>/dev/null && mv "${STATE}.tmp" "$STATE"
+}
+
+split_spec() { # spec -> 设置 CFG / SEC_EXPR / OPT / VAL
+    SPEC_FULL="${1:?}"
+    VAL=""
+    case "$SPEC_FULL" in *=*) VAL=${SPEC_FULL##*=}; SPEC_FULL=${SPEC_FULL%%=*} ;; esac
+    CFG=${SPEC_FULL%%.*}
+    REST=${SPEC_FULL#*.}
+    case "$REST" in
+        @*) SEC_EXPR=${REST%%.*}; OPT=${REST#*.} ;;
+        *)
+            if printf '%s' "$REST" | grep -q '\.'; then
+                SEC_EXPR=${REST%.*}; OPT=${REST##*.}
+            else
+                SEC_EXPR=$REST; OPT=""
+            fi ;;
+    esac
+    case "$SEC_EXPR" in @dnsmasq*) : ;; esac # no-op，保持结构清晰
+    [ "$OPT" = "$REST" ] && OPT="" 2>/dev/null
+    return 0
+}
+
+# ---- 主逻辑 ----
+FLAGS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*) FLAGS="$FLAGS $1"; shift ;;
+        *)  break ;;
+    esac
+done
+CMD="${1:-}"; shift || true
+
+case "$CMD" in
+    show)
+        [ -n "${1:-}" ] || { echo "uci-stub: show 需要 config" >&2; exit 1; }
+        split_spec "$1"
+        if [ -z "$SEC_EXPR" ] || [ "$SEC_EXPR" = "$SPEC_FULL" ]; then
+            render_show "$CFG"
+        else
+            sec=$(resolve_sec "$CFG" "$SEC_EXPR") || exit 1
+            if [ -n "$OPT" ]; then
+                out=$(render_show "$CFG" "$sec" | grep "\.${OPT}=")
+                [ -n "$out" ] || exit 1
+                echo "$out"
+            else
+                render_show "$CFG" "$sec"
+            fi
+        fi
+        ;;
+    get)
+        split_spec "${1:?}"
+        sec=$(resolve_sec "$CFG" "$SEC_EXPR") || exit 1
+        if [ -z "$OPT" ]; then
+            sec_type "$CFG" "$sec"
+        else
+            line=$(opt_line "$CFG" "$sec" "$OPT") || exit 1
+            kindval=${line#* }; kind=${kindval%% *}; vals=${kindval#* }
+            if [ "$kind" = "OPT" ]; then
+                echo "$vals"
+            else
+                for v in $vals; do echo "$v"; done
+            fi
+        fi
+        ;;
+    set)
+        split_spec "${1:?}"
+        if [ -z "$OPT" ]; then
+            # 节类型设置: set cfg.sec=TYPE（匿名节不支持直接 set 创建）
+            case "$SEC_EXPR" in @*) exit 1 ;; esac
+            remove_lines_matching "^${CFG}\.${SEC_EXPR}="
+            echo "${CFG}.${SEC_EXPR}=${VAL}" >> "$STATE"
+        else
+            sec=$(resolve_sec "$CFG" "$SEC_EXPR") || exit 1
+            remove_lines_matching "^${CFG}\.${sec}\.${OPT} "
+            echo "${CFG}.${sec}.${OPT} OPT ${VAL}" >> "$STATE"
+        fi
+        log_call "set ${1}"
+        ;;
+    add)
+        CFG="${1:?}"; TYPE="${2:?}"
+        n=$(next_anon_id)
+        echo "${CFG}.anon:${n}=${TYPE}" >> "$STATE"
+        log_call "add $CFG $TYPE"
+        ;;
+    add_list)
+        split_spec "${1:?}"
+        sec=$(resolve_sec "$CFG" "$SEC_EXPR") || exit 1
+        line=$(opt_line "$CFG" "$sec" "$OPT")
+        if [ -n "$line" ] && printf '%s' "$line" | grep -q " LIST "; then
+            newline="${line} ${VAL}"
+        else
+            newline="${CFG}.${sec}.${OPT} LIST ${VAL}"
+        fi
+        remove_lines_matching "^${CFG}\.${sec}\.${OPT} "
+        echo "$newline" >> "$STATE"
+        log_call "add_list ${1}"
+        ;;
+    del_list)
+        split_spec "${1:?}"
+        sec=$(resolve_sec "$CFG" "$SEC_EXPR") || exit 1
+        line=$(opt_line "$CFG" "$sec" "$OPT")
+        [ -n "$line" ] || exit 1
+        newvals=$(printf '%s' "${line#* }" | tr ' ' '\n' | grep -vxF "$VAL" | grep -v '^LIST$' | tr '\n' ' ')
+        newvals=$(printf '%s' "$newvals" | sed 's/ *$//')
+        remove_lines_matching "^${CFG}\.${sec}\.${OPT} "
+        [ -n "$newvals" ] && echo "${CFG}.${sec}.${OPT} LIST ${newvals}" >> "$STATE"
+        log_call "del_list ${1}"
+        ;;
+    delete)
+        split_spec "${1:?}"
+        sec=$(resolve_sec "$CFG" "$SEC_EXPR") || exit 1
+        if [ -n "$OPT" ]; then
+            remove_lines_matching "^${CFG}\.${sec}\.${OPT} "
+        else
+            remove_lines_matching "^${CFG}\.${sec}\."
+            remove_lines_matching "^${CFG}\.${sec}="
+        fi
+        log_call "delete ${1}"
+        ;;
+    commit)
+        log_call "commit $*"
+        ;;
+    export)
+        CFG="${1:?}"
+        log_call "export $CFG"
+        echo "package $CFG"
+        echo ""
+        for line in $(state_lines | grep "^${CFG}\.[^=]*=" | cut -d= -f1); do
+            sec=${line#*.}
+            type=$(sec_type "$CFG" "$sec")
+            case "$sec" in
+                anon:*) echo "config ${type}" ;;
+                *)     echo "config ${type} '${sec}'" ;;
+            esac
+            state_lines | grep "^${CFG}\.${sec}\.[^ ]* " | while IFS= read -r oline; do
+                key=${oline%% *}; key=${key##*.}
+                kindval=${oline#* }; kind=${kindval%% *}; vals=${kindval#* }
+                case "$kind" in
+                    OPT) echo "	option ${key} '${vals}'" ;;
+                    LIST) for v in $vals; do echo "	list ${key} '${v}'"; done ;;
+                esac
+            done
+            echo ""
+        done
+        ;;
+    import)
+        CFG="${1:?}"
+        log_call "import $CFG"
+        remove_lines_matching "^${CFG}\."
+        n=$(state_lines | grep -oE "anon:[0-9]+" | sed 's/anon://' | sort -n | tail -n 1)
+        n=$(( ${n:-0} + 100 )) # 与既有匿名节编号隔离
+        cur_sec=""
+        while IFS= read -r line; do
+            line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [ -n "$line" ] || continue
+            case "$line" in
+                '#'*|package*) continue ;;
+                config*)
+                    set -- $line
+                    type=$(strip_quotes "$2"); name=$(strip_quotes "${3:-}")
+                    if [ -n "$name" ]; then
+                        cur_sec="$name"
+                    else
+                        n=$((n + 1)); cur_sec="anon:${n}"
+                    fi
+                    echo "${CFG}.${cur_sec}=${type}" >> "$STATE"
+                    ;;
+                option*|list*)
+                    set -- $line
+                    key="$2"; val=$(strip_quotes "$3")
+                    if [ "$1" = "option" ]; then
+                        echo "${CFG}.${cur_sec}.${key} OPT ${val}" >> "$STATE"
+                    else
+                        prev=$(opt_line "$CFG" "$cur_sec" "$key")
+                        if [ -n "$prev" ] && printf '%s' "$prev" | grep -q " LIST "; then
+                            remove_lines_matching "^${CFG}\.${cur_sec}\.${key} "
+                            echo "${prev} ${val}" >> "$STATE"
+                        else
+                            echo "${CFG}.${cur_sec}.${key} LIST ${val}" >> "$STATE"
+                        fi
+                    fi
+                    ;;
+            esac
+        done
+        ;;
+    *)
+        echo "uci-stub: 不支持的命令: ${CMD}" >&2
+        exit 1
+        ;;
+esac
+exit 0

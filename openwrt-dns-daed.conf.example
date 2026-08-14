@@ -1,0 +1,55 @@
+# ============================================================
+# openwrt-dns-daed 配置文件（模板）
+#
+# 用法: 复制到路由器 /etc/openwrt-dns-daed.conf 后按需修改。
+#       首次运行 install 时若该文件不存在，脚本也会自动生成同内容模板。
+#       本文件不会被脚本覆盖，可放心编辑；修改后重新运行 install 生效。
+# ============================================================
+
+# ---- LAN / https-dns-proxy ----
+# force_dns 生效的接口（通常为 lan；多个用空格分隔）
+LAN_IFACES="lan"
+# DoH 上游与启动引导 DNS（bootstrap 仅用于解析 DoH 域名本身）
+HDP_RESOLVER_URL="https://dns.alidns.com/dns-query"
+HDP_BOOTSTRAP_DNS="223.5.5.5,223.6.6.6"
+HDP_LISTEN_ADDR="127.0.0.1"
+HDP_LISTEN_PORT="5053"
+
+# ---- daed DNS（粘贴到 daed GUI 的 DNS 标签页）----
+DAED_DNS_CN_URL="https://dns.alidns.com/dns-query"
+DAED_DNS_FALLBACK_URL="https://dns.google/dns-query"
+
+# ---- daed Routing（粘贴到 daed GUI 的 Routing 标签页）----
+# 分流组名：必须与你在 daed 中实际创建的 Group 名称一致
+DAED_GROUP_PROXY="proxy"
+DAED_GROUP_PREMIUM="premium"
+# 自建节点 endpoint，格式 "IP:协议:端口"，空格分隔。
+# 生成规则形如: dip(IP/32) && l4proto(tcp) && dport(443) -> must_direct
+# 注意：只放行节点入口端口，不要对整台 VPS /32 must_direct，
+# 否则同机部署的 1Panel/Web 等普通服务也会被强制直连。
+# 下面是 RFC 5737 / RFC 3849 文档保留地址占位符，部署前请替换为真实节点！
+# IPv6 写法示例: 2001:db8::1:tcp:443
+NODE_ENDPOINTS="203.0.113.10:tcp:443 203.0.113.10:udp:8443 198.51.100.20:tcp:8443"
+# 内部/私有域名（公司内网域名等），直连；geosite:private 自动追加，无需手写
+DIRECT_INTERNAL_DOMAINS="example.corp"
+# 固定走 premium 组的 geosite 名称（不含 "geosite:" 前缀）；留空则不生成该规则
+PREMIUM_GEOSITES="anthropic paypal"
+# 需强制走代理组的国内域名（位于 geosite:cn 直连规则之前）
+PROXY_CN_DOMAINS="xiaohongshu.com nga.cn xueqiu.com"
+
+# ---- 其他 ----
+# check 时用于连通性测试的域名
+TEST_DOMAIN="example.com"
+# 备份保留份数（回退时用）
+MAX_BACKUPS="8"
+# 自定义 Routing 追加片段目录（可选）。目录下若存在
+#   dns-extra.dae      -> 追加到 DNS 片段末尾
+#   routing-extra.dae  -> 插入到「节点 endpoint 规则」之后
+# 文件内容为原始 dae 配置行，适合放额外的 must_direct 等规则。
+DAED_EXTRA_DIR="/etc/openwrt-dns-daed.d"
+
+# update 自更新地址（默认已指向官方仓库；如 fork 或需禁用，取消注释并改写下面一行）
+# SCRIPT_SELFUPDATE_URL="https://raw.githubusercontent.com/blooddrunk/openwrt-dns-daed/main/openwrt-dns-daed.sh"
+
+# daed 官方安装脚本地址（--install-missing 时使用）
+DAED_INSTALLER_URL="https://raw.githubusercontent.com/kenzok8/openwrt-daede/refs/heads/main/scripts/install.sh"
