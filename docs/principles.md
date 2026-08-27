@@ -31,9 +31,10 @@ LAN 客户端 TCP/UDP 853（DoT）→ REJECT
 ```text
 中国域名 geosite:cn → AliDNS DoH
 其他域名          → Google Public DNS DoH
+默认 `ipversion_prefer: 4` → 有 A/AAAA 时仅响应 A，AAAA 返回空答案
 ```
 
-**关键理解**：`https-dns-proxy` 只负责 dnsmasq/LAN 这条链路；它不会自动把 daed 自己的 DNS upstream 加密。所以 daed 的 DNS upstream 也必须单独改成 DoH，否则国外域名的解析仍走明文 53，继续受企业网关/运营商干扰。
+**关键理解**：`https-dns-proxy` 只负责 dnsmasq/LAN 这条链路；它不会自动把 daed 自己的 DNS upstream 加密。所以 daed 的 DNS upstream 也必须单独改成 DoH，否则国外域名的解析仍走明文 53，继续受企业网关/运营商干扰。`ipversion_prefer: 4` 只影响 daed 处理的 DNS，不会改变链路 A 的返回记录。
 
 ## dnsmasq 层的三个决策
 
@@ -124,6 +125,23 @@ dip(203.0.113.10/32) -> must_direct          # 错误示范
 
 `geosite:openai` 的 premium 特例默认**不启用**（保持注释状态）。需要时把它加入配置文件的 `PREMIUM_GEOSITES` 再重新生成即可。
 
+### 本地网络有 IPv6，但节点 IPv6 不一定可靠
+
+如果宽带具备 IPv6 出口，而 VPS 节点没有 IPv6、IPv6 线路质量不稳定或没有优化，默认采用 IPv4-only 的 daed DNS 配置更稳妥：
+
+```text
+DNS:   ipversion_prefer: 4
+TCP:   http://cp.cloudflare.com + IPv4 1.1.1.1
+UDP:   IPv4 DNS 223.5.5.5:53
+IPv6:  不配置 TCP/UDP 节点检测地址
+```
+
+这里的 `ipversion_prefer: 4` 会让同时有 A/AAAA 记录的域名仅响应 A、对 AAAA 返回空答案，但不是把所有路由器 IPv6 都关闭；节点 endpoint 仍按实际地址和端口生成 `must_direct`。节点检测也应使用 IPv4 目标，避免检测结果被一条不可用的 VPS IPv6 路径拖成超时或误判。
+
+全局页面中的“引导解析器”留空、“备用解析器”使用 `8.8.8.8:53`，是启动/故障回退设置，与 DNS 片段中的 DoH 上游和节点检测 DNS 不是同一个用途。脚本会生成 `daed-global-settings.txt` 作为 GUI 填写清单，但不会直接写入 `wing.db`。
+
+注意：这项策略只约束 daed 的 DNS。LAN 链路仍是 `dnsmasq → https-dns-proxy`，若要让 LAN 客户端也不拿到 AAAA，需要另外配置 HDP/解析过滤或在 LAN 防火墙层处理 IPv6。
+
 ## bootstrap DNS 的作用
 
 ```text
@@ -132,10 +150,13 @@ bootstrap_dns = 223.5.5.5,223.6.6.6
 
 它只在 https-dns-proxy 启动阶段用于解析 `dns.alidns.com` 这个 DoH 域名本身；之后的实际查询全部走 HTTPS/443。只保留 IPv4 引导即可。
 
-## 这套方案的两个限制
+不要把它与 daed 全局页面的“引导解析器 / 备用解析器”混为一谈：前者是链路 A 的 `HDP_BOOTSTRAP_DNS`，后者只是 daed 自身启动或系统解析不可用时的辅助解析器。
+
+## 这套方案的三个限制
 
 1. **强 53 / 拒 853 ≠ 能阻止所有 DoH**。客户端仍可能自行通过 HTTPS/443 访问第三方 DoH 服务。`canary_domains_icloud` / `canary_domains_mozilla` 能约束一部分系统/浏览器行为，但不能等价于「封锁互联网上所有 DoH」。
 2. **daed 配置不要直接编辑数据库**。daed 的配置底层在 `/etc/daed/wing.db`（SQLite），但应通过 GUI 操作（GUI 支持导入/导出）。重装流程：导入 daed 配置 → 核对 DNS → 核对 Routing → 重启验证。
+3. **`ipversion_prefer: 4` 只影响 daed DNS**，不会自动过滤 `https-dns-proxy` 链路的 AAAA；LAN 的 IPv6 策略仍需单独设计。
 
 ## 推荐的部署/排障顺序
 

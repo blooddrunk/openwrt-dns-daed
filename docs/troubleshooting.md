@@ -73,7 +73,23 @@ pname(
 
 `openwrt-dns-daed.sh check` 会对 `wing.db` 做只读信号检查并提示。
 
-## 情况 F：开启 daed 后，v2rayN 真连接延迟 `-1 ms`
+## 情况 F：宽带有 IPv6，但 VPS 节点 IPv6 不稳定
+
+如果节点本身没有 IPv6、IPv6 线路没有优化，或节点的 IPv6 质量不稳定，按以下方式设置 daed：
+
+1. 在 **配置 → DNS** 中粘贴脚本生成的 `daed-dns.dae`，确认包含：
+
+   ```text
+   ipversion_prefer: 4
+   ```
+
+   对同时有 A/AAAA 记录的域名，daed 将仅响应 A，对 AAAA 返回空答案。
+2. 在 **配置 → 全局 / 节点检测** 中按 `daed-global-settings.txt` 填写：TCP 使用 `http://cp.cloudflare.com` 和 IPv4 `1.1.1.1`，UDP 使用 `223.5.5.5:53`，不要填写 TCP/UDP IPv6 检测地址。
+3. “引导解析器”留空、“备用解析器”保持 IPv4 的 `8.8.8.8:53` 即可；这两个字段不是 LAN 客户端的日常 DNS，也不是 DNS 片段中的 DoH 上游。
+
+该设置只影响 daed 的 DNS。若 LAN 客户端仍拿到 AAAA，这是 `dnsmasq → https-dns-proxy` 链路的独立问题，需要另行配置解析过滤或 LAN IPv6 防火墙。
+
+## 情况 G：开启 daed 后，v2rayN 真连接延迟 `-1 ms`
 
 关闭 daed 后节点测试立即恢复 → 代理节点 endpoint 被 `fallback: proxy` 再次捕获。按「目标 IP + 协议 + 端口」精确 `must_direct`：
 
@@ -91,7 +107,7 @@ dip(203.0.113.10/32) && l4proto(udp) && dport(55529) -> must_direct
 3. v2rayN 重新测试 Reality / Hysteria2 真连接延迟
 4. 访问该 VPS 上的 Web 服务，确认其仍可经 `fallback: proxy` 获得较好访问速度
 
-## 情况 G：install/check 报 https-dns-proxy 选项 FAIL
+## 情况 H：install/check 报 https-dns-proxy 选项 FAIL
 
 https-dns-proxy 的 UCI 选项在不同版本间偶有增减。如果 `check` 报某选项不符：
 
@@ -99,7 +115,7 @@ https-dns-proxy 的 UCI 选项在不同版本间偶有增减。如果 `check` �
 2. `uci show https-dns-proxy` 核对该版本实际支持的选项
 3. 重跑 `install` 让脚本按目标值重新写入
 
-## 情况 H：需要彻底还原本脚本的所有改动
+## 情况 I：需要彻底还原本脚本的所有改动
 
 ```sh
 sh /root/openwrt-dns-daed/openwrt-dns-daed.sh rollback          # 还原 UCI（最近一次备份）

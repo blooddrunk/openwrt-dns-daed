@@ -54,9 +54,10 @@ REJECT（阻止绕过路由器 DNS）
 ```text
 中国域名 geosite:cn → AliDNS DoH
 其他域名          → Google Public DNS DoH
+默认 ipversion_prefer: 4 → 有 A/AAAA 时仅响应 A，AAAA 返回空答案
 ```
 
-**关键点**：`https-dns-proxy` 只负责链路 A；daed 自己的 DNS upstream 不会因此自动加密，必须单独改为 DoH，否则国外域名仍会被明文 53 端口的干扰影响。
+**关键点**：`https-dns-proxy` 只负责链路 A；daed 自己的 DNS upstream 不会因此自动加密，必须单独改为 DoH，否则国外域名仍会被明文 53 端口的干扰影响。默认的 `ipversion_prefer: 4` 只影响 daed 处理的 DNS，不会改变链路 A 中 `https-dns-proxy` 返回的记录。
 
 详细原理（为什么 `must_direct`、为什么节点要按 endpoint 精确放行等）见 [docs/principles.md](docs/principles.md)。
 
@@ -96,7 +97,7 @@ sh /tmp/odd.sh install
 3. 清理并加固 dnsmasq（`no-resolv`、清掉失效的 5054/5055、关闭重复劫持）
 4. 配置 https-dns-proxy（AliDNS DoH、force DNS 53/853、单实例）
 5. 重启服务并逐层验证
-6. 生成 daed DNS / Routing 配置片段，并对 `wing.db` 做**只读**信号检查
+6. 生成 daed DNS / Routing 配置片段、全局/节点检测设置清单，并对 `wing.db` 做**只读**信号检查
 7. 输出报告与后续手动步骤提示
 
 ---
@@ -106,9 +107,10 @@ sh /tmp/odd.sh install
 ```text
 1. 在路由器上运行 install（首次会自动生成 /etc/openwrt-dns-daed.conf 模板）
 2. 编辑 /etc/openwrt-dns-daed.conf —— 填入你的真实节点 endpoint、内网域名等
-3. 再次运行 install —— 用你的配置重新生成 daed 片段
-4. 打开 daed GUI，把生成的 DNS / Routing 片段粘贴进对应标签页，保存并重启 daed
-5. 运行 check 复查全部信号
+3. 再次运行 install —— 用你的配置重新生成 daed 片段与 GUI 设置清单
+4. 打开 daed GUI，先按 `daed-global-settings.txt` 设置全局/节点检测
+5. 把生成的 DNS / Routing 片段粘贴进对应标签页，保存并重启 daed
+6. 运行 check 复查全部信号
 ```
 
 配置文件**一旦生成永不被覆盖**，升级脚本也不影响你的自定义内容。
@@ -171,6 +173,7 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 |---|---|---|
 | `DAED_DNS_CN_URL` | `https://dns.alidns.com/dns-query` | 中国域名（geosite:cn）使用的 DoH |
 | `DAED_DNS_FALLBACK_URL` | `https://dns.google/dns-query` | 其余域名使用的 DoH |
+| `DAED_DNS_IPVERSION_PREFER` | `4` | daed DNS 遇到同时存在 A/AAAA 的域名时仅响应 A；留空则省略该设置并允许 IPv6 |
 | `DAED_GROUP_PROXY` | `proxy` | 普通代理组名，**必须与 daed 中实际组名一致** |
 | `DAED_GROUP_PREMIUM` | `premium` | 高级代理组名，同上 |
 | `NODE_ENDPOINTS` | 占位符 | **重点配置**。格式 `IP:协议:端口`，空格分隔；支持 IPv6（如 `2001:db8::1:tcp:443`）。只放行节点入口端口，不要对整台 VPS `/32` must_direct |
@@ -187,6 +190,20 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 | `DAED_EXTRA_DIR` | `/etc/openwrt-dns-daed.d` | 追加片段目录（见下） |
 | `SCRIPT_SELFUPDATE_URL` | 内置官方仓库地址 | `update` 在线自更新的脚本地址；fork 后请覆盖，显式置空则禁用在线更新 |
 | `DAED_INSTALLER_URL` | kenzok8 官方脚本 | `--install-missing` 安装 daed 时使用 |
+
+### daed 全局 / 节点检测（手动 GUI 清单）
+
+以下变量只用于生成 `daed-global-settings.txt`，脚本不会直接写入 daed 的 `wing.db`：
+
+| 变量 | 默认值 | GUI 中的推荐值/作用 |
+|---|---|---|
+| `DAED_BOOTSTRAP_RESOLVER` | 空 | 引导解析器留空，使用 dae 默认值；如显式填写请使用 IPv4 `host:port` |
+| `DAED_FALLBACK_RESOLVER` | `8.8.8.8:53` | 备用解析器；当前值已是 IPv4，仅在系统 DNS 不可用时使用 |
+| `DAED_TCP_CHECK_URL` | `http://cp.cloudflare.com` | 节点 TCP 检测链接 |
+| `DAED_TCP_CHECK_IPV4` | `1.1.1.1` | 节点 TCP 检测 IPv4 地址 |
+| `DAED_UDP_CHECK_DNS` | `223.5.5.5:53` | 节点 UDP 检测 DNS；IPv4-only 配置，不填写 IPv6 地址 |
+
+在当前 IPv4-only 配置下，TCP/UDP 节点检测都不要保留 IPv6 检测地址。若以后需要使用 IPv6，应同时恢复 IPv6 检测并重新评估节点的 IPv6 线路质量。
 
 ### 追加自定义 Routing 规则
 
@@ -206,17 +223,32 @@ dip(203.0.113.99/32) && l4proto(tcp) && dport(8443) -> must_direct
 
 ## daed 的手动步骤（GUI）
 
-daed 的配置保存在 `/etc/daed/wing.db`（SQLite 数据库）。按约定**本脚本绝不直接写库**，只生成片段并做只读检查，DNS/Routing 需要你在 GUI 中粘贴一次：
+daed 的配置保存在 `/etc/daed/wing.db`（SQLite 数据库）。按约定**本脚本绝不直接写库**，只生成片段并做只读检查；全局/节点检测设置需要按清单手动填写，DNS/Routing 需要在 GUI 中粘贴：
 
 1. 打开 daed 面板（LuCI → 服务 → daede，或独立面板地址）
-2. **配置 → DNS**：用 `/root/openwrt-dns-daed/daed/daed-dns.dae` 的内容整体替换并保存
-3. **配置 → Routing**：用 `/root/openwrt-dns-daed/daed/daed-routing.dae` 的内容整体替换并保存
-4. 重启 daed（GUI 内重启，或 `/etc/init.d/daed restart`）
-5. 运行 `check` 复查
+2. **配置 → 全局 / 节点检测**：参照 `/root/openwrt-dns-daed/daed/daed-global-settings.txt` 逐项填写
+3. **配置 → DNS**：用 `/root/openwrt-dns-daed/daed/daed-dns.dae` 的内容整体替换并保存
+4. **配置 → Routing**：用 `/root/openwrt-dns-daed/daed/daed-routing.dae` 的内容整体替换并保存
+5. 重启 daed（GUI 内重启，或 `/etc/init.d/daed restart`）
+6. 运行 `check` 复查
 
-生成的 Routing 片段长这样（按你的配置自动生成）：
+生成的 DNS / Routing 片段长这样（按你的配置自动生成）：
 
 ```text
+dns {
+    ipversion_prefer: 4
+    upstream {
+        alidns: 'https://dns.alidns.com/dns-query'
+        googledns: 'https://dns.google/dns-query'
+    }
+    routing {
+        request {
+            qname(geosite:cn) -> alidns
+            fallback: googledns
+        }
+    }
+}
+
 routing {
     pname(dnsmasq, https-dns-proxy) -> must_direct
 
@@ -250,7 +282,7 @@ routing {
 
 - `noresolv='1'`：忽略 `/tmp/resolv.conf.d/resolv.conf.auto` 中 WAN 下发的 DNS（公司 DNS 即使出现在这里也不会被使用）
 - `dns_redirect='0'`：关闭 dnsmasq 自带的 DNSMASQ HIJACK，DNS 强制接管只由 https-dns-proxy 一家负责
-- 清理 `server` / `doh_server` / `doh_backup_server` 中的失效条目：`127.0.0.1#5054`、`127.0.0.1#5055` 等非 5053 环回端口、明文 IP 上游（如 `223.5.5.5`）
+- 清理 `server` / `doh_server` / `doh_backup_server` 中的失效条目：`127.0.0.1#5054`、`127.0.0.1#5055` 等非 5053 环回端口、明文 IPv4/IPv6 上游（如 `223.5.5.5` 或 `2001:4860:4860::8888`）
 - **保留** `/域名/` 形式的域限定条目（https-dns-proxy 管理的 canary，如 `/mask.icloud.com/`）
 - 确保唯一普通上游 `server=127.0.0.1#5053`
 
@@ -265,7 +297,7 @@ routing {
 
 **重启顺序**：dnsmasq → https-dns-proxy
 
-**不改动**：daed 的 `wing.db`（只读检查）、防火墙其他规则、任何 LAN/WAN 接口配置
+**daed**：生成带 `ipversion_prefer: 4` 的 DNS 片段，并生成全局/节点检测 GUI 设置清单；不直接改动 `wing.db`、任何 LAN/WAN 接口配置或防火墙其他规则
 
 </details>
 
@@ -341,10 +373,13 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh clean --purge   # 全部删除
 检查 Routing 开头是否有 `pname(dnsmasq, https-dns-proxy) -> must_direct`，这是防止 daed 接管自身 DNS 形成回环的关键（情况 D）。
 
 **Q: v2rayN 真连接延迟 `-1 ms`？**
-节点 endpoint 被 `fallback: proxy` 再次捕获形成代理套代理。按 `IP+协议+端口` 精确 `must_direct`（情况 F）。本脚本生成的片段已按此原则生成，确认 `NODE_ENDPOINTS` 填写正确并在 GUI 粘贴即可。
+节点 endpoint 被 `fallback: proxy` 再次捕获形成代理套代理。按 `IP+协议+端口` 精确 `must_direct`（情况 G）。本脚本生成的片段已按此原则生成，确认 `NODE_ENDPOINTS` 填写正确并在 GUI 粘贴即可。
 
 **Q: 域名还是被解析到错误 IP？**
 确认 daed DNS 已全部 DoH 化（情况 E）——GUI 中不能再有 `udp://...:53` / `tcp+udp://...:53` 上游。
+
+**Q: 我的宽带有 IPv6，但 VPS 节点的 IPv6 不稳定，应该怎么办？**
+默认生成的 daed DNS 片段包含 `ipversion_prefer: 4`，并且全局节点检测清单只保留 IPv4 检测。注意：该设置只影响 daed 处理的 DNS；脚本的 LAN `dnsmasq → https-dns-proxy` 链路仍需单独处理 AAAA，或在 LAN 防火墙层禁用 IPv6。详见 [troubleshooting 情况 F](docs/troubleshooting.md)。
 
 更多见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
@@ -355,7 +390,8 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh clean --purge   # 全部删除
 1. **强 53 / 拒 853 ≠ 封锁所有 DoH**：客户端仍可能自行通过 443 端口访问第三方 DoH。canary 域名能约束部分系统/浏览器行为，但不等于全网封锁。
 2. **daed 部分需要手动粘贴一次**：本脚本不直接写 `wing.db`，DNS/Routing 需在 GUI 中粘贴脚本生成的片段（这也是 daed 官方推荐方式）。
 3. **`force_dns` 端口重定向**只覆盖 `LAN_IFACES` 指定的接口（默认 `lan`）。
-4. https-dns-proxy 未来版本的 UCI 选项如有变化，`check` 会以 FAIL 形式提示差异，便于及时发现。
+4. 默认 `ipversion_prefer: 4` 只影响 daed DNS，不会自动过滤 `https-dns-proxy` 链路返回的 AAAA。
+5. https-dns-proxy 未来版本的 UCI 选项如有变化，`check` 会以 FAIL 形式提示差异，便于及时发现。
 
 ---
 

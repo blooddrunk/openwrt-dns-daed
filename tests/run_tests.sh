@@ -127,6 +127,7 @@ assert_rc "check(脏) rc=1" 1 $?
 assert_grep "报 noresolv 失败" "$SB/last.out" "noresolv!=1"
 assert_grep "报 dns_redirect 失败" "$SB/last.out" "dns_redirect=1"
 assert_grep "报明文上游失败" "$SB/last.out" "223.5.5.5"
+assert_grep "报明文 IPv6 上游失败" "$SB/last.out" "2001:4860:4860::8888#53"
 assert_grep "报实例数失败" "$SB/last.out" "实例数为 2"
 assert_grep "报失效环回上游" "$SB/last.out" "存在失效环回上游"
 assert_grep "报 DNSMASQ HIJACK" "$SB/last.out" "DNSMASQ HIJACK"
@@ -143,6 +144,7 @@ assert_grep "清理 server 5055" "$CALLS" "del_list dhcp.@dnsmasq[0].server=127.
 assert_grep "清理 doh_server 5054" "$CALLS" "del_list dhcp.@dnsmasq[0].doh_server=127.0.0.1#5054"
 assert_grep "清理 doh_backup 5054" "$CALLS" "del_list dhcp.@dnsmasq[0].doh_backup_server=127.0.0.1#5054"
 assert_grep "清理明文上游 223.5.5.5" "$CALLS" "del_list dhcp.@dnsmasq[0].server=223.5.5.5"
+assert_grep "清理明文 IPv6 上游" "$CALLS" "del_list dhcp.@dnsmasq[0].server=2001:4860:4860::8888#53"
 assert_not_grep "5053 已存在不再 add_list" "$CALLS" "add_list dhcp.@dnsmasq[0].server="
 assert_grep "删除多余 hdp 实例" "$CALLS" "delete https-dns-proxy.@https-dns-proxy[-1]"
 assert_grep "删除 notrack_dns" "$CALLS" "delete https-dns-proxy.config.notrack_dns"
@@ -166,6 +168,12 @@ assert_grep "Routing: 内部域名" "$RT" "suffix: corp.example"
 assert_grep "Routing: geosite:cn 直连" "$RT" "domain(geosite:cn) -> direct"
 assert_grep "DNS: CN 分流" "$DNSN" "qname(geosite:cn) -> alidns"
 assert_grep "DNS: DoH 上游" "$DNSN" "https://dns.google/dns-query"
+assert_grep "DNS: IPv4 优先" "$DNSN" "ipversion_prefer: 4"
+GLOBAL="$SB/work/daed/daed-global-settings.txt"
+assert_file "daed 全局设置清单" "$GLOBAL"
+assert_grep "全局清单 IPv4 fallback" "$GLOBAL" "备用解析器: 8.8.8.8:53"
+assert_grep "全局清单 UDP IPv4" "$GLOBAL" "UDP 检测 DNS: 223.5.5.5:53"
+assert_grep "全局清单禁用 IPv6 检测" "$GLOBAL" "TCP 检测 IPv6: 不配置"
 # 服务重启顺序
 assert_grep "重启顺序: dnsmasq 在前" "$SB/initd.log" "dnsmasq restart"
 if grep -n "dnsmasq restart" "$SB/initd.log" | head -1 | cut -d: -f1 | \
@@ -251,6 +259,8 @@ sh "$SCRIPT" --config "$SB/etc/conf-gen.conf" install > "$SB/last.out" 2>&1
 assert_rc "首装 rc=0" 0 $?
 assert_file "模板已生成" "$SB/etc/conf-gen.conf"
 assert_grep "模板含 NODE_ENDPOINTS" "$SB/etc/conf-gen.conf" "NODE_ENDPOINTS="
+assert_grep "模板含 IPv4 DNS 偏好" "$SB/etc/conf-gen.conf" "DAED_DNS_IPVERSION_PREFER=\"4\""
+assert_grep "模板含 UDP 检测 DNS" "$SB/etc/conf-gen.conf" "DAED_UDP_CHECK_DNS=\"223.5.5.5:53\""
 assert_grep "提示编辑配置" "$SB/last.out" "请编辑"
 
 echo "== T12: 非法命令/选项应报错 =="

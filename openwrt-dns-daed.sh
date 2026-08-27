@@ -69,8 +69,18 @@ HDP_LISTEN_ADDR="127.0.0.1"
 HDP_LISTEN_PORT="5053"
 DAED_DNS_CN_URL="https://dns.alidns.com/dns-query"
 DAED_DNS_FALLBACK_URL="https://dns.google/dns-query"
+# IPv4-only profile for networks whose proxy nodes do not reliably support IPv6.
+# Leave empty to omit the setting and allow daed to return IPv6 answers.
+DAED_DNS_IPVERSION_PREFER="4"
 DAED_GROUP_PROXY="proxy"
 DAED_GROUP_PREMIUM="premium"
+# daed global/node-check recommendations. These are rendered into a manual
+# checklist only; the script deliberately does not write daed's wing.db.
+DAED_BOOTSTRAP_RESOLVER=""
+DAED_FALLBACK_RESOLVER="8.8.8.8:53"
+DAED_TCP_CHECK_URL="http://cp.cloudflare.com"
+DAED_TCP_CHECK_IPV4="1.1.1.1"
+DAED_UDP_CHECK_DNS="223.5.5.5:53"
 # 节点 endpoint 列表，格式 "IP:协议:端口"（IPv6 也支持，如 2001:db8::1:tcp:443）
 # 占位符示例 IP 来自 RFC5737/198.51.100.0/24 测试网段，部署前请改成真实节点
 NODE_ENDPOINTS="203.0.113.10:tcp:33973 203.0.113.10:udp:50757 198.51.100.20:tcp:12142 198.51.100.20:udp:51237"
@@ -262,6 +272,18 @@ HDP_LISTEN_PORT="5053"
 # ---- daed DNS（粘贴到 daed GUI 的 DNS 标签页）----
 DAED_DNS_CN_URL="https://dns.alidns.com/dns-query"
 DAED_DNS_FALLBACK_URL="https://dns.google/dns-query"
+# 默认只返回 IPv4，适合 VPS 节点 IPv6 不稳定的网络；留空则允许 IPv6
+DAED_DNS_IPVERSION_PREFER="4"
+
+# ---- daed 全局/节点检测（仅生成 GUI 设置清单，不直接写 wing.db）----
+# 引导解析器留空即可使用 dae 默认值；如需显式指定请使用 IPv4 host:port
+DAED_BOOTSTRAP_RESOLVER=""
+# 备用解析器只在系统 resolv.conf 不可用时使用，当前为 IPv4
+DAED_FALLBACK_RESOLVER="8.8.8.8:53"
+# IPv4-only 节点检测配置：不要填写 IPv6 检测地址
+DAED_TCP_CHECK_URL="http://cp.cloudflare.com"
+DAED_TCP_CHECK_IPV4="1.1.1.1"
+DAED_UDP_CHECK_DNS="223.5.5.5:53"
 
 # ---- daed Routing（粘贴到 daed GUI 的 Routing 标签页）----
 # 分流组名：必须与你在 daed 中实际创建的 Group 名称一致
@@ -401,7 +423,12 @@ apply_dnsmasq() {
                 */*)
                     : ;; # 域限定条目（如 canary），由 https-dns-proxy 管理，保留
                 *:*)
-                    warn "保留 ${opt} 条目 ${e}（疑似 IPv6/特殊写法，请人工确认）" ;;
+                    if [ "$opt" = "server" ]; then
+                        uci -q del_list "dhcp.@dnsmasq[0].server=${e}"
+                        warn "已移除明文 IPv6/特殊 server=${e}（会绕过 DoH 链路）"
+                    else
+                        warn "保留 ${opt} 条目 ${e}（疑似 IPv6/特殊写法，请人工确认）"
+                    fi ;;
                 *.*)
                     if [ "$opt" = "server" ]; then
                         uci -q del_list "dhcp.@dnsmasq[0].server=${e}"
@@ -508,6 +535,12 @@ gen_daed_snippets() {
     mkdir -p "$SNIPPET_DIR" || return 1
 
     # ---- DNS 片段 ----
+    local daed_dns_ipversion_line
+    if [ -n "$DAED_DNS_IPVERSION_PREFER" ]; then
+        daed_dns_ipversion_line="    ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER}${NL}"
+    else
+        daed_dns_ipversion_line=""
+    fi
     if [ -f "${DAED_EXTRA_DIR}/dns-extra.dae" ]; then
         dns_extra=$(cat "${DAED_EXTRA_DIR}/dns-extra.dae")
     else
@@ -518,9 +551,10 @@ gen_daed_snippets() {
 # 由 ${SCRIPT_NAME} v${SCRIPT_VERSION} 生成于 $(date '+%Y-%m-%d %H:%M:%S')
 # 用法: daed GUI -> 配置 -> DNS 标签页，整体替换为以下内容后保存
 # 目标: 中国域名走 AliDNS DoH，其余走 Google DoH（全部加密，无 :53 明文）
+# IP 版本偏好: ${DAED_DNS_IPVERSION_PREFER:-未设置（允许 IPv6）}
 # ============================================================
 dns {
-    upstream {
+${daed_dns_ipversion_line}    upstream {
         alidns: '${DAED_DNS_CN_URL}'
         googledns: '${DAED_DNS_FALLBACK_URL}'
     }
@@ -660,6 +694,49 @@ EOF
     log "已生成 daed Routing 片段: ${SNIPPET_DIR}/daed-routing.dae"
 }
 
+gen_daed_global_guide() {
+    section "生成 daed 全局/节点检测设置清单（GUI 手动填写）"
+    mkdir -p "$SNIPPET_DIR" || return 1
+
+    local bootstrap_display
+    if [ -n "$DAED_BOOTSTRAP_RESOLVER" ]; then
+        bootstrap_display="$DAED_BOOTSTRAP_RESOLVER"
+    else
+        bootstrap_display="留空（使用 dae 默认引导解析器）"
+    fi
+
+    cat > "${SNIPPET_DIR}/daed-global-settings.txt" <<EOF
+# ============================================================
+# 由 ${SCRIPT_NAME} v${SCRIPT_VERSION} 生成于 $(date '+%Y-%m-%d %H:%M:%S')
+# daed 全局/节点连通性检测推荐设置
+#
+# 本文件是 GUI 填写清单，不是可单独粘贴的完整 dae 配置；
+# 本脚本不会直接写入 /etc/daed/wing.db。
+# ============================================================
+
+[全局 -> DNS 解析器]
+引导解析器: ${bootstrap_display}
+备用解析器: ${DAED_FALLBACK_RESOLVER:-留空（使用 dae 默认备用解析器）}
+
+[全局 -> 节点连通性检测]
+TCP 检测链接: ${DAED_TCP_CHECK_URL}
+TCP 检测 IPv4: ${DAED_TCP_CHECK_IPV4}
+TCP 检测 IPv6: 不配置（IPv4-only profile）
+TCP 检测 HTTP 方法: HEAD
+
+UDP 检测 DNS: ${DAED_UDP_CHECK_DNS}
+UDP 检测 IPv6: 不配置（IPv4-only profile）
+
+[DNS 配置]
+ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER:-未启用（允许 IPv6）}
+
+说明:
+- 节点检测 DNS 只用于检测节点到 DNS 目标的连通性，不是 LAN 客户端的日常 DNS。
+- 若以后启用 IPv6，应同时恢复 TCP/UDP IPv6 检测地址，并重新评估节点 IPv6 路径。
+EOF
+    log "已生成 daed 全局设置清单: ${SNIPPET_DIR}/daed-global-settings.txt"
+}
+
 daed_readonly_check() {
     section "daed 状态信号（只读检查 wing.db，以 GUI 实际配置为准）"
     local db
@@ -679,6 +756,13 @@ daed_readonly_check() {
         res PASS "daed DNS 已包含两个 DoH 上游信号"
     else
         res WARN "wing.db 中未同时发现两个 DoH 上游（若已在 GUI 粘贴可忽略，旧数据可能残留）"
+    fi
+    if [ -n "$DAED_DNS_IPVERSION_PREFER" ]; then
+        if db_contains "$db" "ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER}"; then
+            res PASS "daed DNS 已包含 ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER} 信号"
+        else
+            res WARN "wing.db 未见 ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER}（请确认 DNS 片段已重新粘贴）"
+        fi
     fi
     if db_contains "$db" "must_direct"; then
         res PASS "wing.db 中存在 must_direct 规则信号"
@@ -715,6 +799,15 @@ verify_dnsmasq_uci() {
     plain=$(printf '%s\n' "$srv" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
     [ -z "$plain" ] && res PASS "server 列表无明文 IP 上游" \
                    || res FAIL "server 列表存在明文 IP 上游: $(printf '%s ' $plain)"
+    ipv6_plain=""
+    for e in $srv; do
+        case "$e" in
+            "$want"|*/*) : ;;
+            *:*) ipv6_plain="${ipv6_plain}${e} " ;;
+        esac
+    done
+    [ -z "$ipv6_plain" ] && res PASS "server 列表无明文 IPv6 上游" \
+                         || res FAIL "server 列表存在明文 IPv6 上游: ${ipv6_plain}"
 
     v=$(uci_get_value dhcp.@dnsmasq[0].dns_redirect)
     [ "$v" = "0" ] && res PASS "dns_redirect=0（无 DNSMASQ HIJACK 重复劫持）" \
@@ -836,6 +929,11 @@ verify_snippets() {
     else
         res WARN "daed 配置片段未生成（运行 install 生成）"
     fi
+    if [ -f "${SNIPPET_DIR}/daed-global-settings.txt" ]; then
+        res PASS "daed 全局/节点检测设置清单已生成（${SNIPPET_DIR}）"
+    else
+        res WARN "daed 全局/节点检测设置清单未生成（运行 install 生成）"
+    fi
 }
 
 verify_layer_a() {
@@ -885,10 +983,11 @@ print_daed_next_steps() {
 
 ${C_BOLD}下一步（daed 部分需要手动完成一次）:${C_OFF}
   1. 打开 daed GUI（LuCI -> 服务 -> daede，或 daed 面板）
-  2. 配置 -> DNS:     用 ${SNIPPET_DIR}/daed-dns.dae 内容整体替换并保存
-  3. 配置 -> Routing: 用 ${SNIPPET_DIR}/daed-routing.dae 内容整体替换并保存
-  4. 重启 daed（${INIT_DIR}/daed restart 或 GUI 内重启）
-  5. 运行 ${SCRIPT_NAME}.sh check 复查全部信号
+  2. 配置 -> 全局/节点检测: 参照 ${SNIPPET_DIR}/daed-global-settings.txt 填写
+  3. 配置 -> DNS:     用 ${SNIPPET_DIR}/daed-dns.dae 内容整体替换并保存
+  4. 配置 -> Routing: 用 ${SNIPPET_DIR}/daed-routing.dae 内容整体替换并保存
+  5. 重启 daed（${INIT_DIR}/daed restart 或 GUI 内重启）
+  6. 运行 ${SCRIPT_NAME}.sh check 复查全部信号
 
 提示:
   - daed 配置保存在 $(daed_wing_db)，本脚本不会直接写库，请通过 GUI 操作
@@ -929,6 +1028,7 @@ cmd_install() {
 
     verify_layer_a
     gen_daed_snippets
+    gen_daed_global_guide
     verify_layer_b
 
     self_copy

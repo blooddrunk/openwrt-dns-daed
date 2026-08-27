@@ -6,6 +6,7 @@ config dnsmasq
 	list server '127.0.0.1#5054'
 	list server '127.0.0.1#5055'
 	list server '223.5.5.5'
+	list server '2001:4860:4860::8888#53'
 	list server '/use-application-dns.net/'
 	list doh_server '127.0.0.1#5054'
 	list doh_server '127.0.0.1#5055'

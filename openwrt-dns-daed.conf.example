@@ -18,6 +18,18 @@ HDP_LISTEN_PORT="5053"
 # ---- daed DNS（粘贴到 daed GUI 的 DNS 标签页）----
 DAED_DNS_CN_URL="https://dns.alidns.com/dns-query"
 DAED_DNS_FALLBACK_URL="https://dns.google/dns-query"
+# 默认只返回 IPv4，适合 VPS 节点 IPv6 不稳定的网络；留空则允许 IPv6
+DAED_DNS_IPVERSION_PREFER="4"
+
+# ---- daed 全局/节点检测（仅生成 GUI 设置清单，不直接写 wing.db）----
+# 引导解析器留空即可使用 dae 默认值；如需显式指定请使用 IPv4 host:port
+DAED_BOOTSTRAP_RESOLVER=""
+# 备用解析器只在系统 resolv.conf 不可用时使用，当前为 IPv4
+DAED_FALLBACK_RESOLVER="8.8.8.8:53"
+# IPv4-only 节点检测配置：不要填写 IPv6 检测地址
+DAED_TCP_CHECK_URL="http://cp.cloudflare.com"
+DAED_TCP_CHECK_IPV4="1.1.1.1"
+DAED_UDP_CHECK_DNS="223.5.5.5:53"
 
 # ---- daed Routing（粘贴到 daed GUI 的 Routing 标签页）----
 # 分流组名：必须与你在 daed 中实际创建的 Group 名称一致
