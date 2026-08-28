@@ -198,7 +198,7 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 
 | 变量 | 默认值 | GUI 中的推荐值/作用 |
 |---|---|---|
-| `DAED_BOOTSTRAP_RESOLVER` | 空 | 引导解析器留空，使用 dae 默认值；如显式填写请使用 IPv4 `host:port` |
+| `DAED_BOOTSTRAP_RESOLVER` | 空 | 引导解析器留空，使用 dae 默认值；如显式填写请使用 IPv4 `host:port`（可选加固见「节点去 DNS 依赖」） |
 | `DAED_FALLBACK_RESOLVER` | `8.8.8.8:53` | 备用解析器；当前值已是 IPv4，仅在系统 DNS 不可用时使用 |
 | `DAED_TCP_CHECK_URL` | `http://cp.cloudflare.com` | 节点 TCP 检测链接 |
 | `DAED_TCP_CHECK_IPV4` | `1.1.1.1` | 节点 TCP 检测 IPv4 地址 |
@@ -237,6 +237,63 @@ DISABLE_IPV6="1"
 - 客户端已缓存的 ULA/RA 最长约 30 分钟自然老化，重连 Wi-Fi/网线可立即清除；
 - 备份与 `check` 均已覆盖 IPv6 状态；`DISABLE_IPV6=0` 时 `check` 会显示一条 SKIP 提示，不产生 FAIL；
 - Tailscale 等自带 v6 隧道的接口不受影响（脚本只操作标准 `wan`/`wan6` 与 `LAN_IFACES`）。
+
+### 节点去 DNS 依赖（可选加固）
+
+daed 的节点来自订阅时，server 通常是域名（如 `bwh.example.top`），每次拨号前都要先解析；DNS 链路瘫痪时节点会连坐失联（日志特征：`bootstrap resolver returned no usable address`、`Marking dialer as unavailable`）。两项可选加固，按需启用：
+
+**1. 显式指定 daed 引导解析器（最简单，推荐先做）**
+
+daed 面板 → 配置 → 全局 → 「引导解析器」填 IPv4 的 `223.5.5.5:53`。这样节点域名与 DoH 上游域名的解析不再依赖系统 resolv.conf 链路，而是直连 AliDNS 明文 53（国内毫秒级、与 DoH 链路和节点完全独立）。对应配置变量 `DAED_BOOTSTRAP_RESOLVER`（脚本只生成 GUI 清单，不写 `wing.db`，需手动填写一次）。
+
+**2. Sub-Store 订阅改写：节点 server 域名 → IP（彻底零解析依赖）**
+
+自建 Sub-Store 的，在对应订阅下添加一个「脚本」类型的节点操作：
+
+```js
+// 将节点 server 从域名改写为 IP；SNI/serverName 保持域名不变，握手不受影响
+const ipMap = {
+  'bwh.example.top': '203.0.113.10',
+  'nosla.example.top': '198.51.100.20',
+  // 按需补充其余节点
+};
+function operator(proxies) {
+  for (const p of proxies) {
+    if (ipMap[p.server]) p.server = ipMap[p.server];
+  }
+  return proxies;
+}
+```
+
+注意：
+
+- Reality 的 `serverName`/SNI 是独立字段，改写 server 后**保持域名不动**，否则握手失败；
+- VPS 换 IP 时需同步修改 `ipMap` 与本脚本的 `NODE_ENDPOINTS`（两者本来就要求一致，不增加维护面）。
+
+只做第 1 项即可消除绝大部分连坐风险；第 2 项适合追求「DNS 全挂也不影响节点拨号」的场景。
+
+### fallback DoH 上游固定走 Reality 节点（可选加固）
+
+**背景**：daed 自身对 fallback DoH 上游（如 cloudflare-dns.com）的查询也会被 dae 按 Routing 分流，通常命中 `fallback: proxy` 从节点出口发出——这也是国外域名 DNS 答案不被污染的原因。代价是 fallback DNS 的可用性 = 所选节点的可用性：当分组策略（如 `min_moving_avg`）选中 Hysteria2 节点、而其 UDP/QUIC 隧道受 QoS 抖动时，DoH 会跟着间歇失败（日志特征：`DNS forward to upstream failed dialer=xx-hysteria2 ... connect error: http3: ...`，该 `http3` 报错来自 Hysteria2 隧道层而非 DoH3）。
+
+**做法**：把 cloudflare-dns.com 的固定 A 记录（`104.16.248.249` / `104.16.249.249`，可 `nslookup cloudflare-dns.com 223.5.5.5` 复核）指向只含 Reality/TCP 节点的分组，规则需位于 `fallback: proxy` 之前：
+
+```text
+dip(104.16.248.249/32, 104.16.249.249/32) -> premium
+```
+
+前提：目标组（示例为 `premium`）只含 Reality/TCP 节点；若混有 Hysteria2，请先新建一个纯 Reality 组并替换规则右侧。该规则只影响发往这两个 DoH 专用地址的流量（客户端自行直连 cloudflare-dns.com 的 DoH 也会顺路受益），不影响其他 Cloudflare 服务。
+
+两种落地方式：
+
+1. **脚本原生（推荐）**：写入 `DAED_EXTRA_DIR`（默认 `/etc/openwrt-dns-daed.d/`）下的 `routing-extra.dae`（会自动插入到节点 endpoint 规则之后、不会被后续规则遮蔽），重跑 `install` 后把重新生成的 `daed-routing.dae` 整体粘贴到 daed GUI；
+2. **手动**：直接在 daed GUI 的 Routing 中该位置添加此行，保存并重启 daed。
+
+**验证**：触发若干次国外域名解析后观察日志，不再出现 `-hysteria2` 的上游失败即为生效：
+
+```sh
+grep "DNS forward to upstream failed" /var/log/daed/daed.log | tail
+```
 
 ### 追加自定义 Routing 规则
 

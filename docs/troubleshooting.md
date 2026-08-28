@@ -109,6 +109,24 @@ WARN Marking dialer as unavailable due to persistent proxy IP failures ...      
 
 链条：v6 拨 DoH 上游超时 → 国外域名 SERVFAIL（国内 alidns 正常，所以只有外网挂）→ 节点域名解析不出 → dialer 标记不可用 → v4/v6 代理流量全部超时。重启 daed 只是复位 DNS 连接与 dialer 状态，不是必然恢复；`DISABLE_IPV6="1"` 才是根治。
 
+**关于 fallback DoH 上游的补充（排障必读）**：daed 自身对 DoH 上游（如 cloudflare-dns.com）的查询也会被 dae 按 Routing 分流，通常命中 `fallback: proxy` 从节点出口发出（这也是国外域名答案不被污染的原因）。判别证据：
+
+```text
+WARN DNS forward to upstream failed dialer=xx-hysteria2 ... network=tcp+4
+     outbound=proxy target=104.16.248.249:443 upstream=https://cloudflare-dns.com:443/dns-query
+```
+
+两个推论：
+
+1. 此时的报错 `http3: parsing frame failed: timeout: no recent network activity` 来自 **Hysteria2 隧道的 QUIC 层**，不是 DoH3（dae 中 `https://` 本来就是 TCP/h2，`h3://` 才是 DoH3），GUI 里没有「DoH3 改 DoH」的开关可动；
+2. fallback DNS 的可用性 = 所选节点的可用性。Hysteria2（UDP）受 QoS 抖动时 DoH 跟着抖。若日志中 `DNS forward to upstream failed` 集中在某 `-hysteria2` dialer 上，可在 Routing 的 `fallback: proxy` 之前把 Cloudflare DoH 的 IP 固定到 Reality（TCP）节点组：
+
+   ```text
+   dip(104.16.248.249/32, 104.16.249.249/32) -> premium
+   ```
+
+   （`premium` 需为只含 Reality/TCP 节点的组；`cloudflare-dns.com` 的 A 记录长期为这两个地址，可用 `nslookup cloudflare-dns.com 223.5.5.5` 复核。）
+
 ## 情况 G：开启 daed 后，v2rayN 真连接延迟 `-1 ms`
 
 关闭 daed 后节点测试立即恢复 → 代理节点 endpoint 被 `fallback: proxy` 再次捕获。按「目标 IP + 协议 + 端口」精确 `must_direct`：
