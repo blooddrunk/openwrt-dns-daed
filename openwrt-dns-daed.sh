@@ -40,7 +40,7 @@
 # =============================================================================
 
 SCRIPT_NAME="openwrt-dns-daed"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 # -----------------------------------------------------------------------------
 # 0. 路径常量（部分可被环境变量覆盖，便于沙箱测试）
@@ -403,7 +403,9 @@ TEST_DOMAIN="example.com"
 # 节点域名解析失败，进而代理整体不可用（详见 README「整机禁用 IPv6」与
 # docs/troubleshooting.md 情况 F）。
 # =1 时 install 将: network.wan.ipv6=0、network.wan6.proto=none、删除 ULA 前缀、
-# dhcp.lan 的 ra/dhcpv6/ndp=disabled，并在有变更时自动 reload network。
+# dhcp.lan 的 ra/dhcpv6/ndp=disabled，并在有变更时自动 reload network；
+# 随后主动清理 LAN/WAN 接口上残留的 ULA/动态 IPv6 地址（实测仅 reload 并不
+# 总会移除，而客户端会把 br-lan 上残留的 v6 地址继续当 DNS 服务器使用）。
 # 恢复: rollback（network 配置随备份一起还原）。
 DISABLE_IPV6="0"
 # 备份保留份数（回退时用）
@@ -680,10 +682,10 @@ apply_ipv6_disable() { # DISABLE_IPV6=1 时禁用整机 IPv6（WAN 获取、ULA�
     uci commit dhcp
     if [ "$IPV6_NET_RELOAD" = "1" ]; then
         info "IPv6 相关配置有变更，稍后将重载 network 并重启 odhcpd"
-        info "注意: 客户端已缓存的 ULA/RA 最长约 30 分钟自然老化，重连 Wi-Fi/网线可立即生效"
     else
         info "IPv6 禁用配置均已就位，无需重载 network"
     fi
+    info "随后将检查并清理接口上残留的 IPv6 地址（如有）"
 }
 
 reload_network_stack() { # 应用网络层配置变更（IPv6 禁用 / rollback 还原 network 时使用）
@@ -699,6 +701,64 @@ reload_network_stack() { # 应用网络层配置变更（IPv6 禁用 / rollback 
     if [ -x "${INIT_DIR}/odhcpd" ]; then
         svc_restart odhcpd || true
     fi
+    return 0
+}
+
+# DISABLE_IPV6=1 时关心的网络设备：LAN_IFACES 与 wan/wan6 各自的 device
+#（旧式 type=bridge 且无 device 选项的配置，运行时设备名为 br-<iface>）。
+# 只输出 UCI 中实际存在的接口，去重；不涉及 tailscale0 等非本脚本管理的设备。
+ipv6_iface_devices() {
+    local ifc dev devs=""
+    for ifc in $LAN_IFACES wan wan6; do
+        uci -q show "network.${ifc}" >/dev/null 2>&1 || continue
+        dev=$(uci_get_value "network.${ifc}.device")
+        if [ -z "$dev" ]; then
+            [ "$(uci_get_value "network.${ifc}.type")" = "bridge" ] && dev="br-${ifc}" || dev="$ifc"
+        fi
+        case " $devs " in *" $dev "*) ;; *) devs="$devs $dev" ;; esac
+    done
+    [ -n "$devs" ] || return 0
+    # shellcheck disable=SC2086
+    printf '%s\n' $devs
+}
+
+# 枚举上述设备上 global 域的 IPv6 地址（ULA fc00::/7 与全球单播均显示为
+# scope global），每行输出 "<dev> <addr>"。link-local（fe80::/10）不在其列。
+list_stale_ipv6_addrs() {
+    have_cmd ip || return 0
+    local dev addrs a
+    for dev in $(ipv6_iface_devices); do
+        addrs=$(ip -6 addr show dev "$dev" 2>/dev/null \
+                | sed -n 's/^ *inet6 \([^ ]*\) .*scope global.*/\1/p')
+        for a in $addrs; do
+            printf '%s %s\n' "$dev" "$a"
+        done
+    done
+    return 0
+}
+
+flush_stale_ipv6_addrs() { # DISABLE_IPV6=1 时清除 LAN/WAN 设备上残留的 IPv6 地址
+    have_uci || { warn "无 uci 命令，跳过残留 IPv6 地址清理"; return 0; }
+    if ! have_cmd ip; then
+        warn "无 ip 命令，无法清理残留 IPv6 地址（重启路由器可达到同等效果）"
+        return 0
+    fi
+    local out dev a
+    out=$(list_stale_ipv6_addrs)
+    if [ -z "$out" ]; then
+        info "LAN/WAN 接口上无残留的 global 域 IPv6 地址"
+    else
+        # reload network 并不总会移除已分配的 ULA/动态地址（实测 br-lan 上可长期
+        # 残留为 deprecated，客户端会把 br-lan 的 v6 地址继续当 DNS 服务器使用）
+        printf '%s\n' "$out" | while read -r dev a; do
+            if ip -6 addr del "$a" dev "$dev" 2>/dev/null; then
+                log "已移除 ${dev} 上的残留 IPv6 地址: ${a}"
+            else
+                warn "移除 ${dev} 上的 ${a} 失败（可能已被内核回收）"
+            fi
+        done
+    fi
+    info "客户端已缓存的 ULA/RDNSS 最长约 30 分钟自然老化，重连 Wi-Fi/网线可立即清除"
     return 0
 }
 
@@ -1173,6 +1233,22 @@ verify_ipv6() {
         [ "$ok" = "1" ] && res PASS "IPv6: dhcp.${ifc} 的 ra/dhcpv6/ndp=disabled" \
             || res FAIL "IPv6: dhcp.${ifc} 的 ra/dhcpv6/ndp 未全部 disabled（重跑 install 修正）"
     done
+    # 运行态：LAN/WAN 设备上不应再有 global 域 IPv6 地址（ULA/动态 GUA 残留）
+    if have_cmd ip; then
+        local out
+        out=$(list_stale_ipv6_addrs)
+        if [ -z "$out" ]; then
+            res PASS "IPv6: LAN/WAN 接口无残留的 global 域 IPv6 地址"
+        else
+            set -- $out
+            while [ $# -ge 2 ]; do
+                res FAIL "IPv6: ${1} 仍残留 ${2}（重跑 install 清理）"
+                shift 2
+            done
+        fi
+    else
+        res SKIP "IPv6: 无 ip 命令，跳过残留地址检查"
+    fi
     return 0
 }
 
@@ -1266,9 +1342,12 @@ cmd_install() {
     apply_hdp
     if [ "$DISABLE_IPV6" = "1" ]; then
         apply_ipv6_disable
-    fi
-    if [ "$DISABLE_IPV6" = "1" ] && [ "$IPV6_NET_RELOAD" = "1" ]; then
-        reload_network_stack
+        if [ "$IPV6_NET_RELOAD" = "1" ]; then
+            reload_network_stack
+        fi
+        # 兜底：reload 并不总是移除已分配的 ULA/动态地址，主动清理，
+        # 避免客户端把 br-lan 上残留的 v6 地址继续当 DNS 服务器使用
+        flush_stale_ipv6_addrs
     fi
     section "重启服务（顺序: dnsmasq -> https-dns-proxy）"
     svc_restart dnsmasq

@@ -57,7 +57,9 @@ TEST_DOMAIN="example.com"
 # 节点域名解析失败，进而代理整体不可用（详见 README「整机禁用 IPv6」与
 # docs/troubleshooting.md 情况 F）。
 # =1 时 install 将: network.wan.ipv6=0、network.wan6.proto=none、删除 ULA 前缀、
-# dhcp.lan 的 ra/dhcpv6/ndp=disabled，并在有变更时自动 reload network。
+# dhcp.lan 的 ra/dhcpv6/ndp=disabled，并在有变更时自动 reload network；
+# 随后主动清理 LAN/WAN 接口上残留的 ULA/动态 IPv6 地址（实测仅 reload 并不
+# 总会移除，而客户端会把 br-lan 上残留的 v6 地址继续当 DNS 服务器使用）。
 # 恢复: rollback（network 配置随备份一起还原）。
 DISABLE_IPV6="0"
 # 备份保留份数（回退时用）

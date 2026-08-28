@@ -97,6 +97,13 @@ DISABLE_IPV6="1"
 
 重跑 `install` 即可整机禁用 IPv6（WAN 获取 / ULA / LAN RA 全关，详见 README「整机禁用 IPv6」）。此时客户端没有 IPv6 地址，AAAA 记录即使返回也无害。
 
+install 同时会清理 LAN/WAN 设备上残留的 ULA/动态 IPv6 地址（v1.2.0 起）——实测仅 reload network 并不总是移除已分配的地址，br-lan 上会长期残留 deprecated ULA，客户端会把它继续当 DNS 服务器使用。已部署旧版本、暂不便重跑 install 的，可手动清理或重启路由器达到同等效果：
+
+```sh
+ip -6 addr show dev br-lan | grep "scope global"   # 找到残留地址
+ip -6 addr del fde7:xxxx::1/60 dev br-lan          # 逐个删除
+```
+
 ### 情况 F 附：间歇性「外网全挂、重启 daed 有时恢复」的完整链条
 
 若日志同时出现下面三类信息，基本可以确定是同一个根因——WAN 上的假 IPv6：

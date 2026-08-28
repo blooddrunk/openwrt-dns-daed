@@ -76,7 +76,51 @@ case "$2" in
 esac
 EOF
     cp "$ROOT/tests/bin/uci" "$SB/bin/uci"
-    chmod +x "$SB/bin/uci" "$SB/bin/nft" "$SB/bin/netstat" "$SB/bin/nslookup"
+
+    # iproute2 替身：维护每设备 IPv6 地址（模拟 br-lan 上残留的 deprecated ULA、
+    # WAN 上的动态 GUA 与不受影响的 link-local）
+    cat > "$SB/bin/ip" <<'EOF'
+#!/bin/sh
+# 用法子集: ip -6 addr show dev DEV / ip -6 addr del ADDR dev DEV
+# 状态文件 $IP_STATE 每行: <dev> <addr> <scope> [flags...]
+# 删除调用记录到 $IP_CALLS
+STATE="${IP_STATE:?IP_STATE 未设置}"
+CALLS="${IP_CALLS:-}"
+[ "$1" = "-6" ] && [ "$2" = "addr" ] || exit 1
+shift 2
+case "$1" in
+    show)
+        [ "$2" = "dev" ] || exit 1
+        dev="$3"
+        out=$(grep "^${dev} " "$STATE" 2>/dev/null)
+        [ -n "$out" ] || exit 0
+        printf '%s\n' "$out" | while read -r d a s rest; do
+            printf '    inet6 %s scope %s %s\n' "$a" "$s" "$rest"
+        done
+        ;;
+    del)
+        # ip -6 addr del ADDR dev DEV
+        addr="$2"; [ "$3" = "dev" ] || exit 1
+        dev="$4"
+        if grep -q "^${dev} ${addr} " "$STATE" 2>/dev/null; then
+            grep -v "^${dev} ${addr} " "$STATE" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
+            [ -n "$CALLS" ] && echo "del $addr dev $dev" >> "$CALLS"
+            exit 0
+        fi
+        exit 1
+        ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod +x "$SB/bin/uci" "$SB/bin/ip" "$SB/bin/nft" "$SB/bin/netstat" "$SB/bin/nslookup"
+
+    # IPv6 地址初始状态：br-lan 残留 deprecated ULA + link-local，WAN 有动态 GUA
+    cat > "$SB/ip.state" <<'EOF'
+br-lan fde7:59de:5678::1/60 global deprecated dynamic
+br-lan fe80::ca75:f4ff:fe5c:e77c/64 link
+eth1 2408:8207:1234:5678::1/64 global dynamic
+EOF
+    : > "$SB/ip.calls"
 
     # init.d 替身
     for svc in dnsmasq https-dns-proxy daed network odhcpd; do
@@ -96,6 +140,7 @@ seed_uci() {
     UCI_STATE="$SB/uci.state" "$SB/bin/uci" import https-dns-proxy < "$SB/etc/config/https-dns-proxy"
     UCI_STATE="$SB/uci.state" "$SB/bin/uci" import network < "$SB/etc/config/network"
     : > "$SB/uci.calls"
+    : > "$SB/ip.calls"
 }
 
 # run_script <子命令及参数...>  —— 返回脚本 rc，stdout 存入 $SB/last.out
@@ -105,6 +150,7 @@ run_script() {
     DD_DAED_DB="$SB/etc/daed/wing.db" \
     DD_TUN_DEV="${DD_TUN_DEV:-$SB/tun-dev}" \
     UCI_STATE="$SB/uci.state" UCI_CALLS="$SB/uci.calls" INITD_LOG="$SB/initd.log" \
+    IP_STATE="$SB/ip.state" IP_CALLS="$SB/ip.calls" \
     NFT_OUT="$NFT_OUT" \
     PATH="$SB/bin:$PATH" \
     sh "$SCRIPT" --config "$SB/etc/openwrt-dns-daed.conf" "$@" > "$SB/last.out" 2>&1
@@ -330,6 +376,10 @@ assert_grep "关闭 LAN NDP" "$CALLS" "set dhcp.lan.ndp=disabled"
 assert_grep "提交 network" "$CALLS" "commit network"
 assert_grep "重载 network" "$SB/initd.log" "network reload"
 assert_grep "重启 odhcpd" "$SB/initd.log" "odhcpd restart"
+assert_grep "清理 br-lan 残留 ULA" "$SB/last.out" "已移除 br-lan 上的残留 IPv6 地址: fde7:59de:5678::1/60"
+assert_grep "清理 WAN 残留 GUA" "$SB/last.out" "已移除 eth1 上的残留 IPv6 地址: 2408:8207:1234:5678::1/64"
+assert_grep "del 调用含 ULA" "$SB/ip.calls" "del fde7:59de:5678::1/60 dev br-lan"
+assert_not_grep "link-local 不受影响" "$SB/ip.calls" "fe80"
 first17_backup=$(ls -1 "$SB/work/backups" | head -n 1)
 assert_grep "备份含 network.uci" "$SB/work/backups/$first17_backup/network.uci" "package network"
 show_state network > "$SB/state17n.show"
@@ -340,11 +390,15 @@ run_script check
 assert_rc "check(ipv6) rc=0" 0 $?
 assert_grep "IPv6 wan 检查 PASS" "$SB/last.out" "IPv6: network.wan.ipv6=0"
 assert_grep "IPv6 LAN 检查 PASS" "$SB/last.out" "ra/dhcpv6/ndp=disabled"
+assert_grep "IPv6 残留地址检查 PASS" "$SB/last.out" "IPv6: LAN/WAN 接口无残留的 global 域 IPv6 地址"
 sleep 1
 : > "$SB/initd.log"
+: > "$SB/ip.calls"
 run_script install
 assert_rc "重复 install(ipv6) rc=0" 0 $?
 assert_not_grep "幂等: 不再 reload network" "$SB/initd.log" "network reload"
+assert_not_grep "幂等: 无残留时不产生 del 调用" "$SB/ip.calls" "del "
+assert_grep "幂等: 提示无残留地址" "$SB/last.out" "无残留的 global 域 IPv6 地址"
 sleep 1
 run_script rollback --to "$SB/work/backups/$first17_backup"
 assert_rc "rollback(ipv6) rc=0" 0 $?

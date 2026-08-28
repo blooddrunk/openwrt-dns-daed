@@ -230,6 +230,7 @@ DISABLE_IPV6="1"
 - `network.wan6.proto='none'`（独立 v6 WAN 接口停用）
 - 删除 `network.globals.ula_prefix`（br-lan 不再持有 ULA/RDNSS）
 - `dhcp.lan`（及 `LAN_IFACES` 内全部接口）的 `ra` / `dhcpv6` / `ndp` = `disabled`
+- **主动清理 LAN/WAN 设备上残留的 ULA/动态 IPv6 地址**：实测仅 reload network 并不总是移除已分配的地址（br-lan 上会长期残留 deprecated ULA），而客户端会把这个 v6 地址继续当 DNS 服务器使用，等于 IPv6 只关了一半（v1.2.0 起）
 - 备份自本版本起包含 `network` 配置，`rollback` 可整体还原
 
 **注意**：
@@ -406,6 +407,7 @@ routing {
 - `network.wan.ipv6='0'`、`network.wan6.proto='none'`、删除 `network.globals.ula_prefix`
 - `LAN_IFACES` 各接口的 `ra` / `dhcpv6` / `ndp` = `disabled`
 - 有实际变更时先 `network reload` + 重启 odhcpd，再走下面的服务重启
+- reload 后主动清理 LAN/WAN 设备上残留的 global 域 IPv6 地址（ULA/动态 GUA；link-local 与非本脚本管理的接口如 tailscale0 不受影响）
 
 **重启顺序**：dnsmasq → https-dns-proxy（`DISABLE_IPV6=1` 且有变更时，最前面额外 network reload + odhcpd）
 
@@ -421,7 +423,7 @@ routing {
 sh /root/openwrt-dns-daed/openwrt-dns-daed.sh check
 ```
 
-逐项检查（只读）：dnsmasq UCI 与运行态、https-dns-proxy 全部选项与实例数、监听端口、nftables（53 重定向 / 853 拒绝 / 无 DNSMASQ HIJACK）、nslookup 连通性、IPv6 禁用状态（`DISABLE_IPV6=1` 时）、daed 片段与 wing.db 信号。输出示例：
+逐项检查（只读）：dnsmasq UCI 与运行态、https-dns-proxy 全部选项与实例数、监听端口、nftables（53 重定向 / 853 拒绝 / 无 DNSMASQ HIJACK）、nslookup 连通性、IPv6 禁用状态与运行态残留地址（`DISABLE_IPV6=1` 时）、daed 片段与 wing.db 信号。输出示例：
 
 ```text
 == 验证链路 A: dnsmasq / https-dns-proxy / nftables ==
@@ -544,7 +546,7 @@ dash -n openwrt-dns-daed.sh && busybox sh -n openwrt-dns-daed.sh   # 语法检�
 sh tests/run_tests.sh                                              # 沙箱冒烟测试
 ```
 
-测试沙箱用 uci/nft/netstat/nslookup/init.d 替身模拟路由器环境，覆盖 install 修复脏状态、幂等重跑、备份、回退（含 wing.db）、清理、模板生成等场景（82 项断言）。
+测试沙箱用 uci/nft/netstat/nslookup/ip 替身模拟路由器环境，覆盖 install 修复脏状态、幂等重跑、备份、回退（含 wing.db）、清理、模板生成等场景（133 项断言）。
 
 ---
 
