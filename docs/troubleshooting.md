@@ -124,3 +124,39 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh clean --purge     # 删除脚本�
 ```
 
 `rollback --with-daed` 会用备份时的 `wing.db` 覆盖当前数据库（备份之后的 daed 改动全部丢失），仅在你确定需要时使用。
+
+## 情况 J：daed 启动报错 / 无法启动
+
+daed 自身日志里常见两类「看不出原因」的报错，含义与处理如下：
+
+| 日志关键词 | 含义 | 处理 |
+| --- | --- | --- |
+| `blocked preconditions: tun-missing`（或提到 `/dev/net/tun`） | 内核没有提供 TUN 设备，daed 启动前提不满足 | `opkg update && opkg install kmod-tun` 后**重启路由器**；LXC/Docker 里跑 OpenWrt 的，需在宿主机开启 `/dev/net/tun` |
+| `Operation not permitted` / 提到特权不足 | daed 没有以 root/CAP_NET_ADMIN 特权运行 | 用 `/etc/init.d/daed restart` 以服务方式启动（procd 会授予特权），不要手动降权运行二进制 |
+| `address already in use` | 端口被占用（常见 53/853 与 dnsmasq 冲突） | `netstat -lnptu | grep -E '(:53|:5053|:853)'` 找到占用者后停用 |
+
+验证 TUN 是否就绪：
+
+```sh
+ls -l /dev/net/tun        # 应显示字符设备 c 10 200
+```
+
+脚本侧的配合：`check` 会在 daed 已安装时自动检查 `/dev/net/tun`；`install --restart-daed` 或服务重启失败时，脚本会原样展示服务输出并对上表关键词给出「原因/解决」提示，无需再搜索。
+
+其他 daed 报错先看完整上下文：
+
+```sh
+logread -e daed | tail -n 30
+```
+
+## 情况 K：脚本自身报 [错误] 并退出
+
+脚本的致命错误（`[错误]` + 退出）都会在下一行输出 `原因/解决:` 提示，按提示操作即可。常见几类：
+
+- **无法写入 / 无法创建目录**：Flash 空间不足或分区只读，`df -h` 排查；空间紧张时可用 `DD_WORK_DIR` 指向 USB 存储。
+- **下载失败（update）**：路由器出站网络/DNS/防火墙问题，或自更新地址失效；按提示 `curl -fsSL <地址>` 手动验证。
+- **未找到可用备份（rollback）**：还没有备份，先运行 `backup`。
+- **恢复配置失败（rollback）**：备份文件损坏或不兼容，按提示手动 `uci import` 查看具体报错。
+
+`check`/`install` 结束若有 FAIL，会输出「FAIL 修复速查」段落，逐条给出一行式修复命令。
+

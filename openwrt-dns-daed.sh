@@ -33,6 +33,7 @@
 #  内部/测试用环境变量（一般无需使用）：
 #    DD_IGNORE_OS=1   DD_IGNORE_ROOT=1   DD_WORK_DIR=/path
 #    DD_INIT_DIR=/path   DD_CONFIG_DIR=/path   DD_DAED_DB=/path
+#    DD_TUN_DEV=/path（TUN 设备路径，默认 /dev/net/tun；测试用）
 # =============================================================================
 #  Licensed under the MIT License.
 # =============================================================================
@@ -115,8 +116,42 @@ log()   { printf "${C_CYAN}>>${C_OFF} %s\n" "$*"; }
 info()  { printf "    %s\n" "$*"; }
 warn()  { printf "${C_YELLOW}[警告]${C_OFF} %s\n" "$*" >&2; }
 err()   { printf "${C_RED}[错误]${C_OFF} %s\n" "$*" >&2; }
-die()   { err "$*"; exit 1; }
+# die <消息> [原因与解决提示]
+# 第二个参数会以「原因/解决」前缀另起一行输出，为简短报错补充背景，
+# 避免用户面对脚本/底层工具的原始报错无处下手。
+die() {
+    err "$1"
+    [ -n "${2:-}" ] && printf "${C_YELLOW}    原因/解决:${C_OFF} %s\n" "$2" >&2
+    exit 1
+}
 section() { printf "\n${C_BOLD}== %s ==${C_OFF}\n" "$*"; }
+
+# 已知底层错误签名 -> 人话解释。输入为文件路径，按固定字符串匹配，
+# 命中一条输出一条（不匹配则静默）。新增报错只需在此追加 case 分支。
+explain_known_errors() { # explain_known_errors <file>
+    [ -f "$1" ] || return 0
+    local text
+    text=$(tr -d '\r' < "$1" 2>/dev/null) || return 0
+    case "$text" in
+        *tun-missing*|*"/dev/net/tun"*|*"net/tun"*)
+            info " ↳ 已知问题: daed/dae 缺少 TUN 设备（内核未提供 tun 模块）。"
+            info "   解决: opkg update && opkg install kmod-tun 后重启路由器；"
+            info "         LXC/Docker 内运行 OpenWrt 时需在宿主机开启 /dev/net/tun" ;;
+        *"Operation not permitted"*|*"CAP_NET_ADMIN"*|*"not enough privileges"*|*"no enough privilege"*)
+            info " ↳ 已知问题: daed/dae 以非 root 或缺少网络管理特权（CAP_NET_ADMIN）运行。"
+            info "   解决: 用 ${INIT_DIR}/daed restart 以服务方式启动（procd 会授予所需特权），"
+            info "         不要手动以普通用户运行 daed/dae 二进制" ;;
+        *"address already in use"*|*"Address already in use"*)
+            info " ↳ 已知问题: 端口已被其他进程占用。"
+            info "   解决: netstat -lnptu | grep -E '(:53|:5053|:853)' 找到占用者后停用它" ;;
+        *"No space left"*|*"no space left"*)
+            info " ↳ 已知问题: Flash/磁盘空间不足。"
+            info "   解决: df -h 查看，清理日志或扩容 overlay 后重试" ;;
+        *"failed to start"*|*"FATA"*)
+            info " ↳ 以上为服务自身日志。查看完整上下文: logread -e daed | tail -n 30" ;;
+    esac
+    return 0
+}
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -127,12 +162,20 @@ svc_exists() { [ -e "${INIT_DIR}/$1" ]; }
 
 svc_restart() {
     if [ -x "${INIT_DIR}/$1" ]; then
-        if "${INIT_DIR}/$1" restart >/dev/null 2>&1; then
+        # 捕获服务自身输出：成功时保持安静，失败时原样展示并尝试解码已知错误
+        local svc_out
+        svc_out=$(mktemp 2>/dev/null) || svc_out="/tmp/${SCRIPT_NAME}.svc.$$"
+        if "${INIT_DIR}/$1" restart >"$svc_out" 2>&1; then
             log "已重启服务 $1"
         else
-            warn "重启服务 $1 失败，请手动检查: ${INIT_DIR}/$1 restart"
+            warn "重启服务 $1 失败，服务输出如下（截取）:"
+            sed -n '1,15p' "$svc_out" >&2
+            explain_known_errors "$svc_out"
+            info "手动排查: ${INIT_DIR}/$1 restart 前台运行；logread -e $1 | tail -n 20"
+            rm -f "$svc_out"
             return 1
         fi
+        rm -f "$svc_out"
     else
         warn "缺少 init 脚本 ${INIT_DIR}/$1，跳过重启"
         return 1
@@ -179,10 +222,12 @@ list_has_line() { # list_has_line <multiline-text> <line>  （整行精确匹配
 # 3. 计数器（check / install 验证共用）
 # -----------------------------------------------------------------------------
 RES_PASS=0; RES_FAIL=0; RES_WARN=0; RES_SKIP=0
+RES_FAIL_TEXT=""
 res() { # res PASS|FAIL|WARN|SKIP <描述>
     case "$1" in
         PASS) RES_PASS=$((RES_PASS + 1)); tag="${C_GREEN}[ ok ]${C_OFF}" ;;
-        FAIL) RES_FAIL=$((RES_FAIL + 1)); tag="${C_RED}[FAIL]${C_OFF}" ;;
+        FAIL) RES_FAIL=$((RES_FAIL + 1)); tag="${C_RED}[FAIL]${C_OFF}"
+              RES_FAIL_TEXT="${RES_FAIL_TEXT}${2}${NL}" ;;
         WARN) RES_WARN=$((RES_WARN + 1)); tag="${C_YELLOW}[warn]${C_OFF}" ;;
         SKIP) RES_SKIP=$((RES_SKIP + 1)); tag="[skip]" ;;
         *) tag="[????]" ;;
@@ -193,6 +238,41 @@ res() { # res PASS|FAIL|WARN|SKIP <描述>
 summary_line() {
     printf "\n${C_BOLD}结果: %d 通过, %d 失败, %d 警告, %d 跳过${C_OFF}\n" \
         "$RES_PASS" "$RES_FAIL" "$RES_WARN" "$RES_SKIP"
+}
+
+# check/install 收尾时的 FAIL 速查：把本轮全部失败描述与已知症状匹配，
+# 输出一行式修复命令，避免面对 FAIL 列表还要逐条搜索。
+print_fail_hints() {
+    [ "$RES_FAIL" -gt 0 ] || return 0
+    section "FAIL 修复速查"
+    local matched=0
+    if printf '%s' "$RES_FAIL_TEXT" | grep -qF "TUN 设备"; then
+        info "· TUN 缺失            -> opkg update && opkg install kmod-tun 并重启路由器（LXC/容器需宿主开启 tun）"
+        matched=1
+    fi
+    if printf '%s' "$RES_FAIL_TEXT" | grep -qF "https-dns-proxy 未安装"; then
+        info "· hdp 未安装          -> opkg update && opkg install https-dns-proxy（或加 --install-missing 重跑）"
+        matched=1
+    fi
+    if printf '%s' "$RES_FAIL_TEXT" | grep -qE 'noresolv|上游缺少|dns_redirect|明文|实例数|残留|HIJACK|force_dns|resolver_url|listen_port'; then
+        info "· UCI/防火墙类不符    -> 直接重跑 install（幂等，会按目标值重写并重启服务）"
+        matched=1
+    fi
+    if printf '%s' "$RES_FAIL_TEXT" | grep -qF ":53 无监听"; then
+        info "· :53 无监听          -> /etc/init.d/dnsmasq restart；仍失败: logread -e dnsmasq | tail -n 20"
+        matched=1
+    fi
+    if printf '%s' "$RES_FAIL_TEXT" | grep -qE '5053 无监听|解析失败'; then
+        info "· 5053/解析失败       -> /etc/init.d/https-dns-proxy restart；查日志: logread -e https-dns-proxy | tail -n 20；确认 DoH 上游可达"
+        matched=1
+    fi
+    if printf '%s' "$RES_FAIL_TEXT" | grep -qF "明文 :53 上游"; then
+        info "· daed 明文上游       -> 在 daed GUI 用 ${SNIPPET_DIR}/daed-dns.dae 整体替换 DNS 配置"
+        matched=1
+    fi
+    [ "$matched" = "1" ] || info "（无自动匹配项；请逐条按 FAIL 行括号内的提示处理）"
+    info "完整排查手册: docs/troubleshooting.md"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -221,7 +301,8 @@ install_missing_packages() {
         info "https-dns-proxy 已安装"
     else
         pm=$(pkg_manager)
-        [ -n "$pm" ] || die "未找到 opkg/apk，请手动安装 https-dns-proxy"
+        [ -n "$pm" ] || die "未找到 opkg/apk，请手动安装 https-dns-proxy" \
+            "固件可能裁剪了包管理器（自编译/精简版 OpenWrt 常见）。手动安装: 下载 ipk 后 opkg install ./https-dns-proxy*.ipk；或换用官方完整固件"
         log "通过 ${pm} 安装 https-dns-proxy"
         case "$pm" in
             opkg) opkg update && opkg install https-dns-proxy || return 1 ;;
@@ -324,7 +405,8 @@ TMPL
 ensure_conf() {
     if [ ! -f "$CONF_FILE" ]; then
         log "生成配置文件 ${CONF_FILE}（含占位符默认值）"
-        gen_conf_template "$CONF_FILE" || die "无法写入 ${CONF_FILE}"
+        gen_conf_template "$CONF_FILE" || die "无法写入 ${CONF_FILE}" \
+            "常见原因: /etc 所在分区只读或空间不足。排查: df -h /etc；只读则 mount -o remount,rw /"
         warn "请编辑 ${CONF_FILE}（尤其是 NODE_ENDPOINTS），然后重新运行 install"
     fi
 }
@@ -390,7 +472,8 @@ apply_dnsmasq() {
     section "配置 dnsmasq"
     have_uci || die "未找到 uci 命令，无法配置 dnsmasq"
     uci -q show dhcp.@dnsmasq[0] >/dev/null 2>&1 || \
-        die "未找到 dhcp.@dnsmasq[0] 配置节"
+        die "未找到 dhcp.@dnsmasq[0] 配置节" \
+            "dnsmasq 未安装，或 /etc/config/dhcp 缺失/损坏。修复: opkg install dnsmasq；若文件为空可从 /etc/config/dhcp 的 rom 副本恢复（/rom/etc/config/dhcp）"
 
     local want_server="127.0.0.1#${HDP_LISTEN_PORT}"
     local srv="" doh="" dohb="" need_add=1
@@ -745,6 +828,16 @@ daed_readonly_check() {
         warn "未检测到 daed，跳过（相关片段仍已生成，装好 daed 后粘贴即可）"
         return 0
     fi
+    # tun-missing 预检：daed 依赖 TUN 设备，缺失时启动即报
+    # 「blocked preconditions: tun-missing」。提前在这里给出可操作的修复提示。
+    tun_dev="${DD_TUN_DEV:-/dev/net/tun}"
+    if [ -e "$tun_dev" ]; then
+        res PASS "TUN 设备 ${tun_dev} 存在（daed 启动前提）"
+    else
+        res FAIL "TUN 设备 ${tun_dev} 不存在（daed 启动会报 blocked preconditions: tun-missing）"
+        info "    ↳ 修复: opkg update && opkg install kmod-tun，然后重启路由器"
+        info "      LXC/Docker 内运行 OpenWrt 时，需在宿主机开启 /dev/net/tun"
+    fi
     if [ ! -f "$db" ]; then
         warn "未找到 ${db}（daed 尚未初始化），请在 GUI 中完成首次配置"
         return 0
@@ -997,7 +1090,8 @@ EOF
 
 cmd_install() {
     preflight_mutating
-    mkdir -p "$WORK_DIR" "$SNIPPET_DIR" "$BACKUP_ROOT" || die "无法创建工作目录 ${WORK_DIR}"
+    mkdir -p "$WORK_DIR" "$SNIPPET_DIR" "$BACKUP_ROOT" || die "无法创建工作目录 ${WORK_DIR}" \
+        "常见原因: Flash 空间不足或 /root 只读。排查: df -h /root；空间不足可清理日志或用 DD_WORK_DIR 指向 USB 存储"
     load_conf
     log "openwrt-dns-daed v${SCRIPT_VERSION} 开始部署（配置文件: ${CONF_FILE}）"
 
@@ -1016,7 +1110,8 @@ cmd_install() {
     else
         warn "daed 未安装，将只生成配置片段（可加 --install-missing 自动安装）"
     fi
-    hdp_installed || die "缺少 https-dns-proxy，无法继续"
+    hdp_installed || die "缺少 https-dns-proxy，无法继续" \
+        "上一步自动安装未成功（--install-missing 时安装器输出见上）。手动安装: opkg update && opkg install https-dns-proxy"
 
     do_backup "install"
     apply_dnsmasq
@@ -1033,9 +1128,10 @@ cmd_install() {
 
     self_copy
     summary_line
+    print_fail_hints
     print_daed_next_steps
     if [ "$RES_FAIL" -gt 0 ]; then
-        warn "存在 ${RES_FAIL} 项失败，请按上面提示排查（docs/troubleshooting.md）"
+        warn "存在 ${RES_FAIL} 项失败，请按上面速查与提示排查（docs/troubleshooting.md）"
         return 1
     fi
     log "部署完成"
@@ -1053,13 +1149,15 @@ cmd_check() {
     verify_layer_a
     verify_layer_b
     summary_line
+    print_fail_hints
     [ "$RES_FAIL" -eq 0 ] || return 1
     return 0
 }
 
 cmd_backup() {
     preflight_mutating
-    mkdir -p "$BACKUP_ROOT" || die "无法创建 ${BACKUP_ROOT}"
+    mkdir -p "$BACKUP_ROOT" || die "无法创建 ${BACKUP_ROOT}" \
+        "常见原因: Flash 空间不足或分区只读。排查: df -h /root；只读则 mount -o remount,rw /"
     load_conf
     do_backup "manual"
     log "现有备份列表:"
@@ -1080,14 +1178,16 @@ cmd_rollback() {
     else
         dir=$(latest_backup_dir)
     fi
-    [ -n "$dir" ] && [ -d "$dir" ] || die "未找到可用备份（目录: ${BACKUP_ROOT}）"
+    [ -n "$dir" ] && [ -d "$dir" ] || die "未找到可用备份（目录: ${BACKUP_ROOT}）" \
+        "尚无任何备份（install 会自动创建），或 --to 指定的目录不存在。查看现有备份: ls -1 ${BACKUP_ROOT}；创建备份: $0 backup"
     log "回退到备份: ${dir}"
     [ -f "${dir}/info.txt" ] && info "备份信息: $(tr '\n' ' ' < "${dir}/info.txt")"
 
     section "恢复 UCI 配置"
     if [ -f "${dir}/dhcp.uci" ]; then
         uci import dhcp < "${dir}/dhcp.uci" && uci commit dhcp \
-            && log "已恢复 dhcp 配置" || die "恢复 dhcp 配置失败"
+            && log "已恢复 dhcp 配置" || die "恢复 dhcp 配置失败" \
+            "备份文件可能损坏或与当前 uci 版本不兼容。检查: cat ${dir}/dhcp.uci；可手动执行 uci import dhcp < 该文件 查看具体报错"
     else
         warn "备份中无 dhcp.uci，跳过"
     fi
@@ -1095,7 +1195,8 @@ cmd_rollback() {
         uci import https-dns-proxy < "${dir}/https-dns-proxy.uci" \
             && uci commit https-dns-proxy \
             && log "已恢复 https-dns-proxy 配置" \
-            || die "恢复 https-dns-proxy 配置失败"
+            || die "恢复 https-dns-proxy 配置失败" \
+               "备份文件可能损坏，或 https-dns-proxy 已卸载导致 uci 无法导入。检查: cat ${dir}/https-dns-proxy.uci；已卸载则先 opkg install https-dns-proxy"
     else
         warn "备份中无 https-dns-proxy.uci，跳过"
     fi
@@ -1135,7 +1236,8 @@ cmd_update() {
     if [ -n "$SCRIPT_SELFUPDATE_URL" ]; then
         log "从 ${SCRIPT_SELFUPDATE_URL} 获取最新脚本"
         tmp=$(mktemp 2>/dev/null) || tmp="${WORK_DIR}/.update.$$"
-        fetch_to "$SCRIPT_SELFUPDATE_URL" "$tmp" || { rm -f "$tmp"; die "下载失败"; }
+        fetch_to "$SCRIPT_SELFUPDATE_URL" "$tmp" || { rm -f "$tmp"; die "下载失败（${SCRIPT_SELFUPDATE_URL}）" \
+            "常见原因: 路由器无出站网络/DNS 不可用/防火墙拦截 GitHub，或地址失效。手动验证: curl -fsSL '${SCRIPT_SELFUPDATE_URL}' -o /tmp/t.sh；也可直接重新运行一键安装命令获取最新脚本"; }
         sh -n "$tmp" || { rm -f "$tmp"; die "下载的脚本语法校验失败，放弃更新"; }
         newver=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' "$tmp" | head -n 1)
         mkdir -p "$WORK_DIR"
@@ -1225,7 +1327,7 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION} —— OpenWrt 防 DNS 劫持一键部署（dn
   sh ./${SCRIPT_NAME}.sh rollback --with-daed
 
 内部/测试环境变量:
-  DD_IGNORE_OS / DD_IGNORE_ROOT / DD_WORK_DIR / DD_INIT_DIR / DD_CONFIG_DIR / DD_DAED_DB
+  DD_IGNORE_OS / DD_IGNORE_ROOT / DD_WORK_DIR / DD_INIT_DIR / DD_CONFIG_DIR / DD_DAED_DB / DD_TUN_DEV
 EOF
 }
 

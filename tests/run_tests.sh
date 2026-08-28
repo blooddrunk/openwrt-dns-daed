@@ -38,6 +38,9 @@ build_sandbox() {
     cp "$FIX/https-dns-proxy.seed" "$SB/etc/config/https-dns-proxy"
     cp "$FIX/wing-db.fixture" "$SB/etc/daed/wing.db"
 
+    # TUN 设备替身：让 /dev/net/tun 预检在沙箱中结果确定（T14 会指向不存在的路径）
+    : > "$SB/tun-dev"
+
     # 测试配置（覆盖默认值，并指向沙箱内的追加片段目录，避免触碰真实 /etc）
     cat > "$SB/etc/openwrt-dns-daed.conf" <<EOF
 NODE_ENDPOINTS="203.0.113.10:tcp:33973 203.0.113.10:udp:50757 198.51.100.20:tcp:12142"
@@ -98,6 +101,7 @@ run_script() {
     DD_IGNORE_OS=1 DD_IGNORE_ROOT=1 \
     DD_WORK_DIR="$SB/work" DD_INIT_DIR="$SB/initd" DD_CONFIG_DIR="$SB/etc/config" \
     DD_DAED_DB="$SB/etc/daed/wing.db" \
+    DD_TUN_DEV="${DD_TUN_DEV:-$SB/tun-dev}" \
     UCI_STATE="$SB/uci.state" UCI_CALLS="$SB/uci.calls" INITD_LOG="$SB/initd.log" \
     NFT_OUT="$NFT_OUT" \
     PATH="$SB/bin:$PATH" \
@@ -252,7 +256,7 @@ echo "== T11: 配置文件模板生成 =="
 mkdir -p "$SB/work2"
 DD_IGNORE_OS=1 DD_IGNORE_ROOT=1 \
 DD_WORK_DIR="$SB/work2" DD_INIT_DIR="$SB/initd" DD_CONFIG_DIR="$SB/etc/config" \
-DD_DAED_DB="$SB/etc/daed/wing.db" \
+DD_DAED_DB="$SB/etc/daed/wing.db" DD_TUN_DEV="$SB/tun-dev" \
 UCI_STATE="$SB/uci.state" UCI_CALLS="$SB/uci.calls" INITD_LOG="$SB/initd.log" \
 NFT_OUT="$FIX/nft-clean.txt" PATH="$SB/bin:$PATH" \
 sh "$SCRIPT" --config "$SB/etc/conf-gen.conf" install > "$SB/last.out" 2>&1
@@ -274,6 +278,37 @@ assert_grep "未知选项提示" "$SB/last.out" "未知选项"
 echo "== T13: check --no-net-test =="
 run_script check --no-net-test
 assert_grep "跳过网络测试" "$SB/last.out" "网络测试已禁用"
+
+echo "== T14: TUN 缺失时 check 报 FAIL 并给出 kmod-tun 修复速查 =="
+DD_TUN_DEV="$SB/no-such-tun" run_script check
+assert_rc "check(无 TUN) rc=1" 1 $?
+assert_grep "报 tun-missing FAIL" "$SB/last.out" "blocked preconditions: tun-missing"
+assert_grep "FAIL 行给出修复指向" "$SB/last.out" "opkg update && opkg install kmod-tun"
+assert_grep "速查段含 TUN 项" "$SB/last.out" "TUN 缺失"
+# 恢复 TUN 存在时同一状态应回到通过（对照）
+run_script check
+assert_rc "check(有 TUN) rc=0" 0 $?
+
+echo "== T15: update 下载失败时输出 原因/解决 提示 =="
+cat >> "$SB/etc/openwrt-dns-daed.conf" <<EOF
+SCRIPT_SELFUPDATE_URL="http://127.0.0.1:1/unreachable.sh"
+EOF
+run_script update
+assert_rc "update(死链) rc=1" 1 $?
+assert_grep "报下载失败" "$SB/last.out" "下载失败"
+assert_grep "输出原因/解决提示" "$SB/last.out" "原因/解决"
+
+echo "== T16: 服务重启失败时展示输出并解码 tun-missing =="
+cat > "$SB/initd/daed" <<'EOF'
+#!/bin/sh
+echo "[ERROR] blocked preconditions: tun-missing" >&2
+exit 1
+EOF
+chmod +x "$SB/initd/daed"
+run_script install --restart-daed
+assert_grep "原样展示服务输出" "$SB/last.out" "[ERROR] blocked preconditions: tun-missing"
+assert_grep "解码出 kmod-tun 提示" "$SB/last.out" "缺少 TUN 设备"
+assert_grep "给出手动排查入口" "$SB/last.out" "logread -e daed"
 
 echo ""
 echo "=========================================="

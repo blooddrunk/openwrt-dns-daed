@@ -9,7 +9,7 @@
 |---|---|
 | `bin/uci` | OpenWrt `uci` 命令的最小可测替身：实现 `show/get/set/add/add_list/del_list/delete/import/export/commit`，状态持久化于 `UCI_STATE` 指定的文件，变更同时记录到 `UCI_CALLS` |
 | `fixtures/` | 种子与样本：脏/净状态下的 nft 规则集、netstat 输出、wing.db 文本替身、uci 配置种子 |
-| `run_tests.sh` | 测试驱动：搭建沙箱（含 nft/netstat/nslookup/init.d 替身）并执行 T0–T13 场景 |
+| `run_tests.sh` | 测试驱动：搭建沙箱（含 nft/netstat/nslookup/init.d 替身）并执行 T0–T16 场景 |
 
 ## 运行
 
@@ -36,6 +36,9 @@ sh tests/run_tests.sh
 - **T11** 首次运行自动生成配置模板
 - **T12** 非法命令/选项报错
 - **T13** `--no-net-test` 生效
+- **T14** TUN 设备缺失（`DD_TUN_DEV` 指向不存在路径）时 `check` 报 `tun-missing` FAIL，输出 kmod-tun 修复速查；恢复后对照通过
+- **T15** `update` 遇死链时 `die` 输出「原因/解决」提示
+- **T16** 服务重启失败时原样展示服务输出，并解码 `tun-missing` 为 kmod-tun 处理建议
 
 ## 局限
 
