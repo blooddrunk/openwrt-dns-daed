@@ -125,7 +125,7 @@ WARN DNS forward to upstream failed dialer=xx-hysteria2 ... network=tcp+4
    dip(104.16.248.249/32, 104.16.249.249/32) -> premium
    ```
 
-   （`premium` 需为只含 Reality/TCP 节点的组；`cloudflare-dns.com` 的 A 记录长期为这两个地址，可用 `nslookup cloudflare-dns.com 223.5.5.5` 复核。）
+   （`premium` 需为只含 Reality/TCP 节点的组；`cloudflare-dns.com` 的 A 记录长期为这两个地址，可用 `nslookup cloudflare-dns.com 223.5.5.5` 复核。也可再加一条 `domain(suffix: cloudflare-dns.com) -> premium` 覆盖 A 记录变化——注意这条流量只能靠 SNI 嗅探命中 domain 规则，`dip` 是确定性兜底，详见 README「fallback DoH 上游固定走 Reality 节点」。）
 
 ## 情况 G：开启 daed 后，v2rayN 真连接延迟 `-1 ms`
 

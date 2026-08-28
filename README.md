@@ -276,24 +276,40 @@ function operator(proxies) {
 
 **背景**：daed 自身对 fallback DoH 上游（如 cloudflare-dns.com）的查询也会被 dae 按 Routing 分流，通常命中 `fallback: proxy` 从节点出口发出——这也是国外域名 DNS 答案不被污染的原因。代价是 fallback DNS 的可用性 = 所选节点的可用性：当分组策略（如 `min_moving_avg`）选中 Hysteria2 节点、而其 UDP/QUIC 隧道受 QoS 抖动时，DoH 会跟着间歇失败（日志特征：`DNS forward to upstream failed dialer=xx-hysteria2 ... connect error: http3: ...`，该 `http3` 报错来自 Hysteria2 隧道层而非 DoH3）。
 
-**做法**：把 cloudflare-dns.com 的固定 A 记录（`104.16.248.249` / `104.16.249.249`，可 `nslookup cloudflare-dns.com 223.5.5.5` 复核）指向只含 Reality/TCP 节点的分组，规则需位于 `fallback: proxy` 之前：
+**做法**：在 `fallback: proxy` 之前，把发往 DoH 上游的流量指向只含 Reality/TCP 节点的分组。支持 IP 与域名两种匹配写法，推荐**双写互为补充**：
 
 ```text
+# dip 兜底 cloudflare-dns.com 的固定 A 记录：不依赖嗅探，SNI-less 流量也能命中
 dip(104.16.248.249/32, 104.16.249.249/32) -> premium
+# domain 覆盖 A 记录漂移与其它带该 SNI 的流量（如浏览器自带 DoH）
+domain(suffix: cloudflare-dns.com) -> premium
 ```
 
-前提：目标组（示例为 `premium`）只含 Reality/TCP 节点；若混有 Hysteria2，请先新建一个纯 Reality 组并替换规则右侧。该规则只影响发往这两个 DoH 专用地址的流量（客户端自行直连 cloudflare-dns.com 的 DoH 也会顺路受益），不影响其他 Cloudflare 服务。
+两种写法的取舍：
+
+| | `dip()` | `domain()` |
+|---|---|---|
+| 命中确定性 | 确定，不依赖任何机制 | 依赖 SNI 嗅探对 daed 自身流量生效（`dial_mode: ip` 时嗅探整体关闭，domain 规则将失效） |
+| 抗 A 记录变化 | 差（IP 写死，可 `nslookup cloudflare-dns.com 223.5.5.5` 复核） | 好 |
+| 覆盖面 | 仅列出的 IP | 所有带该 SNI 的流量 |
+| 无 SNI 的流量（如直连 `https://1.1.1.1` 的 DoH） | 能命中（需要时把列表扩为 `..., 1.1.1.1/32, 1.0.0.1/32`） | 匹配不到 |
+
+背景知识：dae 的 `domain()` 域名来源有两个——daed 处理过的 DNS 应答（IP→域名回溯）与 SNI 嗅探。对「daed 自身的 DoH 上游」这条流量，前者不适用（`cloudflare-dns.com` 由 daed 内部引导解析、未经客户端查询，不进 IP→域名缓存），只能依赖后者；这就是推荐 `dip` 打底、`domain` 补充的原因。
+
+前提：目标组（示例为 `premium`）只含 Reality/TCP 节点；若混有 Hysteria2，请先新建一个纯 Reality 组并替换规则右侧。规则只影响发往 DoH 专用地址/带该 SNI 的流量，不影响其他 Cloudflare 服务。
 
 两种落地方式：
 
 1. **脚本原生（推荐）**：写入 `DAED_EXTRA_DIR`（默认 `/etc/openwrt-dns-daed.d/`）下的 `routing-extra.dae`（会自动插入到节点 endpoint 规则之后、不会被后续规则遮蔽），重跑 `install` 后把重新生成的 `daed-routing.dae` 整体粘贴到 daed GUI；
 2. **手动**：直接在 daed GUI 的 Routing 中该位置添加此行，保存并重启 daed。
 
-**验证**：触发若干次国外域名解析后观察日志，不再出现 `-hysteria2` 的上游失败即为生效：
+**验证**：触发若干次国外域名解析后观察日志，不再出现 `-hysteria2` 的上游失败、且 DoH 上游连接的 `dialer=` 已变为 Reality 节点即为生效：
 
 ```sh
 grep "DNS forward to upstream failed" /var/log/daed/daed.log | tail
 ```
+
+若只加了 `domain` 规则而上游仍走原组，说明该版本对 daed 自身流量的嗅探不生效——保留 `dip` 那条即可（确定性命中）。
 
 ### 追加自定义 Routing 规则
 
