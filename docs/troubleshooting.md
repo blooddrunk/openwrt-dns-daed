@@ -71,7 +71,7 @@ pname(
 正确:      https://dns.alidns.com/dns-query   https://dns.google/dns-query
 ```
 
-`openwrt-dns-daed.sh check` 会对 `wing.db` 做只读信号检查并提示。
+`openwrt-dns-daed.sh check` 会对 `wing.db`（含 `-wal`）做只读信号检查并提示；daed 的最新配置在 WAL 未 checkpoint 时只存在于 `wing.db-wal` 中，脚本两份都查。
 
 ## 情况 F：宽带有 IPv6，但 VPS 节点 IPv6 不稳定
 
@@ -168,7 +168,7 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh rollback --with-daed   # 连 daed 
 sh /root/openwrt-dns-daed/openwrt-dns-daed.sh clean --purge     # 删除脚本全部产物
 ```
 
-`rollback --with-daed` 会用备份时的 `wing.db` 覆盖当前数据库（备份之后的 daed 改动全部丢失），仅在你确定需要时使用。
+`rollback --with-daed` 会用备份时的 `wing.db`（连同 `-wal`，备份存在时）覆盖当前数据库，并先清除现役 `-wal`/`-shm` 以免新旧文件叠加错乱（备份之后的 daed 改动全部丢失），仅在你确定需要时使用。
 
 ## 情况 J：daed 启动报错 / 无法启动
 

@@ -423,7 +423,7 @@ routing {
 sh /root/openwrt-dns-daed/openwrt-dns-daed.sh check
 ```
 
-逐项检查（只读）：dnsmasq UCI 与运行态、https-dns-proxy 全部选项与实例数、监听端口、nftables（53 重定向 / 853 拒绝 / 无 DNSMASQ HIJACK）、nslookup 连通性、IPv6 禁用状态与运行态残留地址（`DISABLE_IPV6=1` 时）、daed 片段与 wing.db 信号。输出示例：
+逐项检查（只读）：dnsmasq UCI 与运行态、https-dns-proxy 全部选项与实例数、监听端口、nftables（53 重定向 / 853 拒绝 / 无 DNSMASQ HIJACK）、nslookup 连通性、IPv6 禁用状态与运行态残留地址（`DISABLE_IPV6=1` 时）、daed 片段与 wing.db（含 `-wal`）信号。输出示例：
 
 ```text
 == 验证链路 A: dnsmasq / https-dns-proxy / nftables ==
@@ -462,7 +462,7 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh rollback --to /root/openwrt-dns-da
 sh /root/openwrt-dns-daed/openwrt-dns-daed.sh rollback --with-daed   # 连 wing.db 一起恢复（慎用）
 ```
 
-每次 `install`/`backup` 前自动创建备份，包含：`uci export` 与原始配置文件、nftables 规则集快照、`wing.db` 副本。默认保留最近 8 份。
+每次 `install`/`backup` 前自动创建备份，包含：`uci export` 与原始配置文件、nftables 规则集快照、`wing.db`（及未 checkpoint 的 `-wal`）副本。默认保留最近 8 份。
 
 **清理**
 
@@ -546,7 +546,7 @@ dash -n openwrt-dns-daed.sh && busybox sh -n openwrt-dns-daed.sh   # 语法检�
 sh tests/run_tests.sh                                              # 沙箱冒烟测试
 ```
 
-测试沙箱用 uci/nft/netstat/nslookup/ip 替身模拟路由器环境，覆盖 install 修复脏状态、幂等重跑、备份、回退（含 wing.db）、清理、模板生成等场景（133 项断言）。
+测试沙箱用 uci/nft/netstat/nslookup/ip 替身模拟路由器环境，覆盖 install 修复脏状态、幂等重跑、备份、回退（含 wing.db）、清理、模板生成等场景（153 项断言）。
 
 ---
 

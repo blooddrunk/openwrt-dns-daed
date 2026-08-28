@@ -40,7 +40,7 @@
 # =============================================================================
 
 SCRIPT_NAME="openwrt-dns-daed"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 
 # -----------------------------------------------------------------------------
 # 0. 路径常量（部分可被环境变量覆盖，便于沙箱测试）
@@ -216,10 +216,61 @@ uci_get_value() {
     uci -q get "$1" 2>/dev/null
 }
 
-# 对二进制文件做只读字符串包含检查（替代 grep -a / strings，busybox 友好）
+# 对二进制文件做只读字符串包含检查（替代 grep -a / strings）。
+# 注意：不可用 tr 的 '[:print:]' 字符类——busybox tr 不支持（会当成字面字符集，
+# 整个检查静默失效）；用八进制可打印 ASCII 范围 \040-\176，GNU/busybox 通吃。
 db_contains() { # db_contains <file> <literal-string>
     [ -f "$1" ] || return 1
-    tr -c '[:print:]' '\n' < "$1" 2>/dev/null | grep -qF -- "$2"
+    tr -c '\040-\176' '\n' < "$1" 2>/dev/null | grep -qF -- "$2"
+}
+
+# 取字符串在单个 db 文件文本化内容中最后一次出现的行号（未命中输出空）
+db_last_lineno() { # db_last_lineno <file> <literal-string>
+    [ -f "$1" ] || return 0
+    tr -c '\040-\176' '\n' < "$1" 2>/dev/null | grep -nF -- "$2" | tail -1 | cut -d: -f1
+    return 0
+}
+
+# wing.db 信号文件列表：主库在前、存在的 -wal 在后。
+# SQLite WAL 模式下未 checkpoint 时，最新配置可能只存在于 -wal 中，
+# 信号检查必须两份都看，否则会把“已在 GUI 粘贴”误报成“尚未应用”。
+daed_db_signal_files() { # daed_db_signal_files <db-path>
+    [ -f "$1" ] && printf '%s\n' "$1"
+    [ -f "${1}-wal" ] && printf '%s\n' "${1}-wal"
+    return 0
+}
+
+# wing.db（含 -wal）信号包含检查
+wingdb_contains() { # wingdb_contains <db-path> <literal-string>
+    local f
+    # shellcheck disable=SC2046
+    for f in $(daed_db_signal_files "$1"); do
+        db_contains "$f" "$2" && return 0
+    done
+    return 1
+}
+
+# 判断 daed DNS 当前是否仍是明文 :53 上游。需区分“当前行”与“历史行”：
+#   - -wal 追加写且帧按写入时间排序，文件内靠后的行更新——明文行与 DoH 行
+#     谁最后出现谁新；daed 默认配置（udp://223.5.5.5:53 等）的历史帧因此被排除；
+#   - 主库 checkpoint 后只保留当前行镜像——-wal 缺失或不含相关信号时，
+#     沿用“主库含明文即明文”的判定。
+# 两种情形都能正确报 FAIL：从未配置过 DoH（只有明文行），以及粘贴 DoH 后又改回明文。
+wingdb_plaintext_upstream() { # wingdb_plaintext_upstream <db-path>
+    local db="$1" wal="${1}-wal" pl dh
+    if [ -s "$wal" ]; then
+        pl=$(db_last_lineno "$wal" "udp://223.5.5.5:53")
+        [ -z "$pl" ] && pl=$(db_last_lineno "$wal" "tcp+udp://8.8.8.8:53")
+        dh=$(db_last_lineno "$wal" "$DAED_DNS_CN_URL")
+        [ -z "$dh" ] && dh=$(db_last_lineno "$wal" "$DAED_DNS_FALLBACK_URL")
+        if [ -n "$pl" ] || [ -n "$dh" ]; then
+            # -wal 中存在相关信号：以 -wal 内最后出现的先后为准
+            [ -n "$pl" ] && { [ -z "$dh" ] || [ "$pl" -gt "$dh" ]; } && return 0
+            return 1
+        fi
+        # 两者皆不在 -wal：落到主库判定
+    fi
+    db_contains "$db" "udp://223.5.5.5:53" || db_contains "$db" "tcp+udp://8.8.8.8:53"
 }
 
 list_has_line() { # list_has_line <multiline-text> <line>  （整行精确匹配）
@@ -476,6 +527,9 @@ do_backup() { # do_backup <原因>
         if cp "$db" "${dir}/wing.db" 2>/dev/null; then
             info "已备份 daed 数据库（运行中复制，仅作兜底；重要配置请用 GUI 导出）"
         fi
+        # WAL 未 checkpoint 时最新配置只存在于 -wal 中，一并备份才能完整恢复
+        #（-shm 是可重建的索引，无需备份）
+        [ -f "${db}-wal" ] && cp "${db}-wal" "${dir}/wing.db-wal" 2>/dev/null
     fi
     have_cmd nft && nft list ruleset > "${dir}/nft.ruleset" 2>/dev/null
     {
@@ -989,7 +1043,7 @@ EOF
 }
 
 daed_readonly_check() {
-    section "daed 状态信号（只读检查 wing.db，以 GUI 实际配置为准）"
+    section "daed 状态信号（只读检查 wing.db 及 -wal，以 GUI 实际配置为准）"
     local db
     db=$(daed_wing_db)
     if ! daed_installed; then
@@ -1010,27 +1064,27 @@ daed_readonly_check() {
         warn "未找到 ${db}（daed 尚未初始化），请在 GUI 中完成首次配置"
         return 0
     fi
-    if db_contains "$db" "udp://223.5.5.5:53" || db_contains "$db" "tcp+udp://8.8.8.8:53"; then
+    if wingdb_plaintext_upstream "$db"; then
         res FAIL "daed DNS 疑似仍是明文 :53 上游（在 GUI 中替换为 DoH 片段）"
     fi
-    if db_contains "$db" "$DAED_DNS_CN_URL" && db_contains "$db" "$DAED_DNS_FALLBACK_URL"; then
+    if wingdb_contains "$db" "$DAED_DNS_CN_URL" && wingdb_contains "$db" "$DAED_DNS_FALLBACK_URL"; then
         res PASS "daed DNS 已包含两个 DoH 上游信号"
     else
         res WARN "wing.db 中未同时发现两个 DoH 上游（若已在 GUI 粘贴可忽略，旧数据可能残留）"
     fi
     if [ -n "$DAED_DNS_IPVERSION_PREFER" ]; then
-        if db_contains "$db" "ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER}"; then
+        if wingdb_contains "$db" "ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER}"; then
             res PASS "daed DNS 已包含 ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER} 信号"
         else
             res WARN "wing.db 未见 ipversion_prefer: ${DAED_DNS_IPVERSION_PREFER}（请确认 DNS 片段已重新粘贴）"
         fi
     fi
-    if db_contains "$db" "must_direct"; then
+    if wingdb_contains "$db" "must_direct"; then
         res PASS "wing.db 中存在 must_direct 规则信号"
         local ep t ip ok=1
         for ep in $NODE_ENDPOINTS; do
             t=${ep%:*}; ip=${t%:*}
-            db_contains "$db" "$ip" || { ok=0; warn "wing.db 未见 endpoint IP: ${ip}"; }
+            wingdb_contains "$db" "$ip" || { ok=0; warn "wing.db 未见 endpoint IP: ${ip}"; }
         done
         [ "$ok" = "1" ] && res PASS "全部节点 endpoint IP 均有信号" \
                        || res WARN "部分节点 endpoint IP 未见信号（确认 Routing 已粘贴）"
@@ -1449,8 +1503,16 @@ cmd_rollback() {
         db=$(daed_wing_db)
         if [ -f "${dir}/wing.db" ]; then
             svc_exists daed && "${INIT_DIR}/daed" stop >/dev/null 2>&1
-            cp "${dir}/wing.db" "$db" && log "已恢复 ${db}" \
-                || warn "恢复 wing.db 失败"
+            # 先清掉现役 -wal/-shm：把旧主库直接盖回去而留下新 -wal，SQLite 会把
+            # 过期帧当有效数据读到；-shm 无需恢复，daed 启动时会自动重建
+            rm -f "${db}-wal" "${db}-shm"
+            if cp "${dir}/wing.db" "$db" 2>/dev/null; then
+                log "已恢复 ${db}"
+                [ -f "${dir}/wing.db-wal" ] && cp "${dir}/wing.db-wal" "${db}-wal" 2>/dev/null \
+                    && log "已恢复 ${db}-wal"
+            else
+                warn "恢复 wing.db 失败"
+            fi
             svc_exists daed && "${INIT_DIR}/daed" start >/dev/null 2>&1
             warn "注意: 该操作会覆盖 daed 当前全部配置（含备份之后的所有改动）"
         else

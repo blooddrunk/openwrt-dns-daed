@@ -77,6 +77,19 @@ esac
 EOF
     cp "$ROOT/tests/bin/uci" "$SB/bin/uci"
 
+    # busybox 兼容哨兵：目标是 OpenWrt 的 busybox tr，它不支持 GNU 的
+    # [:class:] 字符类（会被当成字面字符集、检查静默失效）。沙箱运行在
+    # GNU coreutils 上，用此替身让任何字符类用法在测试期就报错。
+    cat > "$SB/bin/tr" <<'EOF'
+#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        *\[:*]:*) echo "tr(GNU-only class): $a" >&2; exit 1 ;;
+    esac
+done
+exec /usr/bin/tr "$@"
+EOF
+
     # iproute2 替身：维护每设备 IPv6 地址（模拟 br-lan 上残留的 deprecated ULA、
     # WAN 上的动态 GUA 与不受影响的 link-local）
     cat > "$SB/bin/ip" <<'EOF'
@@ -112,7 +125,7 @@ case "$1" in
     *) exit 1 ;;
 esac
 EOF
-    chmod +x "$SB/bin/uci" "$SB/bin/ip" "$SB/bin/nft" "$SB/bin/netstat" "$SB/bin/nslookup"
+    chmod +x "$SB/bin/uci" "$SB/bin/ip" "$SB/bin/nft" "$SB/bin/netstat" "$SB/bin/nslookup" "$SB/bin/tr"
 
     # IPv6 地址初始状态：br-lan 残留 deprecated ULA + link-local，WAN 有动态 GUA
     cat > "$SB/ip.state" <<'EOF'
@@ -408,6 +421,69 @@ assert_grep "ULA 前缀恢复" "$SB/state17r.show" "ula_prefix"
 show_state dhcp > "$SB/state17d.show"
 assert_grep "RA 恢复 hybrid" "$SB/state17d.show" "ra='hybrid'"
 assert_grep "rollback 后重载 network" "$SB/initd.log" "network reload"
+
+echo "== T18: WAL 未 checkpoint 时信号从 -wal 读取，明文历史行不误报 =="
+build_sandbox
+seed_uci
+run_script install
+assert_rc "install(wal 场景) rc=0" 0 $?
+# 主库 = 陈旧快照（不含任何 daed 配置信号）；当前配置全部位于 -wal：
+# 前半是 daed 默认明文 DNS 的历史帧，后半是当前 DoH 配置帧
+cat > "$SB/etc/daed/wing.db" <<'EOF'
+FAKE-SQLITE-HEADER (stale checkpoint snapshot, no config rows)
+EOF
+cat > "$SB/etc/daed/wing.db-wal" <<'EOF'
+WAL frame 1: historical revision (daed default plaintext DNS)
+dns: upstream { alidns: 'udp://223.5.5.5:53' googledns: 'tcp+udp://8.8.8.8:53' }
+WAL frame 2: current revision (DoH snippet pasted)
+dns: upstream alidns='https://dns.alidns.com/dns-query' googledns='https://dns.google/dns-query'
+dns: ipversion_prefer: 4
+dns: routing qname(geosite:cn) -> alidns, fallback: googledns
+routing: dip(203.0.113.10/32) && l4proto(tcp) && dport(33973) -> must_direct
+routing: dip(203.0.113.10/32) && l4proto(udp) && dport(50757) -> must_direct
+routing: dip(198.51.100.20/32) && l4proto(tcp) && dport(12142) -> must_direct
+group: proxy premium
+EOF
+run_script check
+assert_rc "check(wal) rc=0" 0 $?
+assert_not_grep "明文历史行不误报" "$SB/last.out" "疑似仍是明文"
+assert_grep "两个 DoH 上游信号来自 -wal" "$SB/last.out" "daed DNS 已包含两个 DoH 上游信号"
+assert_grep "ipversion 信号来自 -wal" "$SB/last.out" "ipversion_prefer: 4 信号"
+assert_grep "must_direct 信号来自 -wal" "$SB/last.out" "存在 must_direct 规则信号"
+assert_grep "endpoint IP 信号来自 -wal" "$SB/last.out" "全部节点 endpoint IP 均有信号"
+assert_not_grep "DoH 上游 WARN 不出现" "$SB/last.out" "未同时发现两个 DoH 上游"
+assert_not_grep "ipversion WARN 不出现" "$SB/last.out" "未见 ipversion_prefer"
+assert_not_grep "must_direct WARN 不出现" "$SB/last.out" "未见 must_direct"
+
+echo "== T19: -wal 中明文为最新写入（DoH 后改回明文）应报 FAIL =="
+cat > "$SB/etc/daed/wing.db-wal" <<'EOF'
+WAL frame 1: old DoH revision
+dns: upstream alidns='https://dns.alidns.com/dns-query' googledns='https://dns.google/dns-query'
+routing: dip(203.0.113.10/32) && l4proto(tcp) && dport(33973) -> must_direct
+WAL frame 2: reverted to plaintext (latest write)
+dns: upstream { alidns: 'udp://223.5.5.5:53' googledns: 'tcp+udp://8.8.8.8:53' }
+EOF
+run_script check
+assert_rc "check(改回明文) rc=1" 1 $?
+assert_grep "明文 FAIL 按最新写入触发" "$SB/last.out" "daed DNS 疑似仍是明文 :53 上游"
+
+echo "== T20: backup 备份 -wal；rollback --with-daed 正确处置 sidecar =="
+run_script backup
+assert_rc "backup rc=0" 0 $?
+t20_backup=$(ls -1 "$SB/work/backups" | tail -n 1)
+assert_file "备份含 wing.db-wal" "$SB/work/backups/$t20_backup/wing.db-wal"
+assert_grep "-wal 内容完整" "$SB/work/backups/$t20_backup/wing.db-wal" "reverted to plaintext"
+echo "tampered-wal" > "$SB/etc/daed/wing.db-wal"
+run_script rollback --to "$SB/work/backups/$t20_backup" --with-daed
+assert_rc "rollback(含 wal) rc=0" 0 $?
+assert_grep "-wal 随备份恢复" "$SB/etc/daed/wing.db-wal" "reverted to plaintext"
+if grep -qF "tampered-wal" "$SB/etc/daed/wing.db-wal"; then bad "-wal 恢复失败"; else ok "-wal 篡改内容已清除"; fi
+# 回滚到无 -wal 的旧备份：现役 -wal 必须清掉，避免旧主库 + 新 -wal 叠加错乱
+t20_old=$(ls -1 "$SB/work/backups" | head -n 1)
+rm -f "$SB/work/backups/$t20_old/wing.db-wal"
+run_script rollback --to "$SB/work/backups/$t20_old" --with-daed
+assert_rc "rollback(无 wal 备份) rc=0" 0 $?
+if [ -e "$SB/etc/daed/wing.db-wal" ]; then bad "回滚到无 -wal 备份后残留 -wal"; else ok "回滚后现役 -wal 已清除"; fi
 
 echo ""
 echo "=========================================="
