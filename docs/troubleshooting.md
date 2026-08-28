@@ -87,7 +87,27 @@ pname(
 2. 在 **配置 → 全局 / 节点检测** 中按 `daed-global-settings.txt` 填写：TCP 使用 `http://cp.cloudflare.com` 和 IPv4 `1.1.1.1`，UDP 使用 `223.5.5.5:53`，不要填写 TCP/UDP IPv6 检测地址。
 3. “引导解析器”留空、“备用解析器”保持 IPv4 的 `8.8.8.8:53` 即可；这两个字段不是 LAN 客户端的日常 DNS，也不是 DNS 片段中的 DoH 上游。
 
-该设置只影响 daed 的 DNS。若 LAN 客户端仍拿到 AAAA，这是 `dnsmasq → https-dns-proxy` 链路的独立问题，需要另行配置解析过滤或 LAN IPv6 防火墙。
+该设置只影响 daed 的 DNS。若 LAN 客户端仍拿到 AAAA，这是 `dnsmasq → https-dns-proxy` 链路的独立问题（实测部分 daed 版本连自身处理的 AAAA 查询也不会过滤，向 `192.168.10.1` 查 google 的 AAAA 仍会返回真实记录）。
+
+**根治手段（推荐）**：当 WAN 上的 IPv6「有名无实」时（有全球地址但 `ping -6 2400:3200::1` 不通，或上级 NAT 不下发 PD），在 `/etc/openwrt-dns-daed.conf` 设置：
+
+```sh
+DISABLE_IPV6="1"
+```
+
+重跑 `install` 即可整机禁用 IPv6（WAN 获取 / ULA / LAN RA 全关，详见 README「整机禁用 IPv6」）。此时客户端没有 IPv6 地址，AAAA 记录即使返回也无害。
+
+### 情况 F 附：间歇性「外网全挂、重启 daed 有时恢复」的完整链条
+
+若日志同时出现下面三类信息，基本可以确定是同一个根因——WAN 上的假 IPv6：
+
+```text
+WARN DNS ingress fast path failed; sending SERVFAIL ... error=Get "https://[2606:4700:...]:443/dns-query...": TLS handshake timeout   # daed 用不通的 v6 拨 DoH 上游
+WARN handleConn: failed to dial ... [REALITY]: dial to xxx.example.top:443: bootstrap resolver returned no usable address                # DNS 瘫痪连累节点域名解析
+WARN Marking dialer as unavailable due to persistent proxy IP failures ...                                                            # 节点被标记不可用，代理整体下线
+```
+
+链条：v6 拨 DoH 上游超时 → 国外域名 SERVFAIL（国内 alidns 正常，所以只有外网挂）→ 节点域名解析不出 → dialer 标记不可用 → v4/v6 代理流量全部超时。重启 daed 只是复位 DNS 连接与 dialer 状态，不是必然恢复；`DISABLE_IPV6="1"` 才是根治。
 
 ## 情况 G：开启 daed 后，v2rayN 真连接延迟 `-1 ms`
 

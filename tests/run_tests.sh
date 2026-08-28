@@ -36,6 +36,7 @@ build_sandbox() {
 
     cp "$FIX/dhcp.seed" "$SB/etc/config/dhcp"
     cp "$FIX/https-dns-proxy.seed" "$SB/etc/config/https-dns-proxy"
+    cp "$FIX/network.seed" "$SB/etc/config/network"
     cp "$FIX/wing-db.fixture" "$SB/etc/daed/wing.db"
 
     # TUN 设备替身：让 /dev/net/tun 预检在沙箱中结果确定（T14 会指向不存在的路径）
@@ -78,7 +79,7 @@ EOF
     chmod +x "$SB/bin/uci" "$SB/bin/nft" "$SB/bin/netstat" "$SB/bin/nslookup"
 
     # init.d 替身
-    for svc in dnsmasq https-dns-proxy daed; do
+    for svc in dnsmasq https-dns-proxy daed network odhcpd; do
         cat > "$SB/initd/$svc" <<'EOF'
 #!/bin/sh
 echo "$(basename "$0") $*" >> "$INITD_LOG"
@@ -93,6 +94,7 @@ seed_uci() {
     rm -f "$SB/uci.state" "$SB/uci.calls"
     UCI_STATE="$SB/uci.state" "$SB/bin/uci" import dhcp < "$SB/etc/config/dhcp"
     UCI_STATE="$SB/uci.state" "$SB/bin/uci" import https-dns-proxy < "$SB/etc/config/https-dns-proxy"
+    UCI_STATE="$SB/uci.state" "$SB/bin/uci" import network < "$SB/etc/config/network"
     : > "$SB/uci.calls"
 }
 
@@ -309,6 +311,49 @@ run_script install --restart-daed
 assert_grep "原样展示服务输出" "$SB/last.out" "[ERROR] blocked preconditions: tun-missing"
 assert_grep "解码出 kmod-tun 提示" "$SB/last.out" "缺少 TUN 设备"
 assert_grep "给出手动排查入口" "$SB/last.out" "logread -e daed"
+
+echo "== T17: DISABLE_IPV6=1 时 install 禁用整机 IPv6 =="
+build_sandbox
+seed_uci
+cat >> "$SB/etc/openwrt-dns-daed.conf" <<EOF
+DISABLE_IPV6="1"
+EOF
+run_script install
+assert_rc "install(ipv6) rc=0" 0 $?
+CALLS="$SB/uci.calls"
+assert_grep "停用 wan.ipv6" "$CALLS" "set network.wan.ipv6=0"
+assert_grep "停用 wan6" "$CALLS" "set network.wan6.proto=none"
+assert_grep "删除 ULA 前缀" "$CALLS" "delete network.globals.ula_prefix"
+assert_grep "关闭 LAN RA" "$CALLS" "set dhcp.lan.ra=disabled"
+assert_grep "关闭 LAN DHCPv6" "$CALLS" "set dhcp.lan.dhcpv6=disabled"
+assert_grep "关闭 LAN NDP" "$CALLS" "set dhcp.lan.ndp=disabled"
+assert_grep "提交 network" "$CALLS" "commit network"
+assert_grep "重载 network" "$SB/initd.log" "network reload"
+assert_grep "重启 odhcpd" "$SB/initd.log" "odhcpd restart"
+first17_backup=$(ls -1 "$SB/work/backups" | head -n 1)
+assert_grep "备份含 network.uci" "$SB/work/backups/$first17_backup/network.uci" "package network"
+show_state network > "$SB/state17n.show"
+assert_grep "wan6 已停用" "$SB/state17n.show" "proto='none'"
+assert_grep "wan.ipv6=0" "$SB/state17n.show" "ipv6='0'"
+if grep -qF "ula_prefix" "$SB/state17n.show"; then bad "ULA 前缀仍存在"; else ok "ULA 前缀已删除"; fi
+run_script check
+assert_rc "check(ipv6) rc=0" 0 $?
+assert_grep "IPv6 wan 检查 PASS" "$SB/last.out" "IPv6: network.wan.ipv6=0"
+assert_grep "IPv6 LAN 检查 PASS" "$SB/last.out" "ra/dhcpv6/ndp=disabled"
+sleep 1
+: > "$SB/initd.log"
+run_script install
+assert_rc "重复 install(ipv6) rc=0" 0 $?
+assert_not_grep "幂等: 不再 reload network" "$SB/initd.log" "network reload"
+sleep 1
+run_script rollback --to "$SB/work/backups/$first17_backup"
+assert_rc "rollback(ipv6) rc=0" 0 $?
+show_state network > "$SB/state17r.show"
+assert_grep "wan6 恢复 dhcpv6" "$SB/state17r.show" "proto='dhcpv6'"
+assert_grep "ULA 前缀恢复" "$SB/state17r.show" "ula_prefix"
+show_state dhcp > "$SB/state17d.show"
+assert_grep "RA 恢复 hybrid" "$SB/state17d.show" "ra='hybrid'"
+assert_grep "rollback 后重载 network" "$SB/initd.log" "network reload"
 
 echo ""
 echo "=========================================="

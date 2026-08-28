@@ -185,6 +185,7 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `DISABLE_IPV6` | `0` | 可选整机禁用 IPv6（见下节）。适合上游拿不到 PD / IPv6 实际不通的网络 |
 | `TEST_DOMAIN` | `example.com` | check 连通性测试域名 |
 | `MAX_BACKUPS` | `8` | 备份保留份数，超出自动轮转删除 |
 | `DAED_EXTRA_DIR` | `/etc/openwrt-dns-daed.d` | 追加片段目录（见下） |
@@ -204,6 +205,38 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 | `DAED_UDP_CHECK_DNS` | `223.5.5.5:53` | 节点 UDP 检测 DNS；IPv4-only 配置，不填写 IPv6 地址 |
 
 在当前 IPv4-only 配置下，TCP/UDP 节点检测都不要保留 IPv6 检测地址。若以后需要使用 IPv6，应同时恢复 IPv6 检测并重新评估节点的 IPv6 线路质量。
+
+### 整机禁用 IPv6（DISABLE_IPV6，可选）
+
+**适用场景**：上游拿不到 IPv6 PD 前缀（例如上级是光猫/路由器 NAT、企业内网），或 WAN 上虽有全球 IPv6 地址但实际不通的宽带。
+
+**为什么建议关掉**：WAN 上存在「有名无实」的全球 IPv6 地址时，daed 解析 DoH 上游（如 cloudflare-dns.com）会拿到 AAAA 并优先用 v6 拨号，而 v6 实际不通会导致：
+
+1. 国外域名 DNS 间歇性 SERVFAIL（国内 alidns 正常，表现为「国内能上、外网全挂」）；
+2. DNS 瘫痪连累节点域名（如 `*.haoqi90.top`）解析失败，daed 将节点标记不可用，代理整体下线（v4 也一样超时）；
+3. LAN 客户端从 RA 拿到 ULA 后不断尝试 IPv6 连接，产生大量 `handleConn: failed to dial [v6]:443` 日志。
+
+重启 daed 只是复位 DNS 连接与节点状态，**不是必然恢复，更不是根治**；彻底移除这个「假 IPv6」才是。
+
+**开启方法**：在 `/etc/openwrt-dns-daed.conf` 中设置后重跑 `install`：
+
+```sh
+DISABLE_IPV6="1"
+```
+
+`install` 将执行（幂等，仅在值有变化时才 `reload network`）：
+
+- `network.wan.ipv6='0'`（v4 WAN 接口不再获取 IPv6）
+- `network.wan6.proto='none'`（独立 v6 WAN 接口停用）
+- 删除 `network.globals.ula_prefix`（br-lan 不再持有 ULA/RDNSS）
+- `dhcp.lan`（及 `LAN_IFACES` 内全部接口）的 `ra` / `dhcpv6` / `ndp` = `disabled`
+- 备份自本版本起包含 `network` 配置，`rollback` 可整体还原
+
+**注意**：
+
+- 客户端已缓存的 ULA/RA 最长约 30 分钟自然老化，重连 Wi-Fi/网线可立即清除；
+- 备份与 `check` 均已覆盖 IPv6 状态；`DISABLE_IPV6=0` 时 `check` 会显示一条 SKIP 提示，不产生 FAIL；
+- Tailscale 等自带 v6 隧道的接口不受影响（脚本只操作标准 `wan`/`wan6` 与 `LAN_IFACES`）。
 
 ### 追加自定义 Routing 规则
 
@@ -295,9 +328,15 @@ routing {
 - `procd_trigger_wan6=0`、heartbeat 三项、`user=nobody`、`group=nogroup`、`listen_addr=127.0.0.1`
 - 实例：`resolver_url` = AliDNS DoH，`bootstrap_dns` = `223.5.5.5,223.6.6.6`，`listen_port=5053`
 
-**重启顺序**：dnsmasq → https-dns-proxy
+**network / dhcp 的 LAN 侧（仅当 `DISABLE_IPV6=1`）**
 
-**daed**：生成带 `ipversion_prefer: 4` 的 DNS 片段，并生成全局/节点检测 GUI 设置清单；不直接改动 `wing.db`、任何 LAN/WAN 接口配置或防火墙其他规则
+- `network.wan.ipv6='0'`、`network.wan6.proto='none'`、删除 `network.globals.ula_prefix`
+- `LAN_IFACES` 各接口的 `ra` / `dhcpv6` / `ndp` = `disabled`
+- 有实际变更时先 `network reload` + 重启 odhcpd，再走下面的服务重启
+
+**重启顺序**：dnsmasq → https-dns-proxy（`DISABLE_IPV6=1` 且有变更时，最前面额外 network reload + odhcpd）
+
+**daed**：生成带 `ipversion_prefer: 4` 的 DNS 片段，并生成全局/节点检测 GUI 设置清单；不直接改动 `wing.db` 或防火墙其他规则（LAN/WAN 接口配置仅在 `DISABLE_IPV6=1` 时按上节调整）
 
 </details>
 
@@ -309,7 +348,7 @@ routing {
 sh /root/openwrt-dns-daed/openwrt-dns-daed.sh check
 ```
 
-逐项检查（只读）：dnsmasq UCI 与运行态、https-dns-proxy 全部选项与实例数、监听端口、nftables（53 重定向 / 853 拒绝 / 无 DNSMASQ HIJACK）、nslookup 连通性、daed 片段与 wing.db 信号。输出示例：
+逐项检查（只读）：dnsmasq UCI 与运行态、https-dns-proxy 全部选项与实例数、监听端口、nftables（53 重定向 / 853 拒绝 / 无 DNSMASQ HIJACK）、nslookup 连通性、IPv6 禁用状态（`DISABLE_IPV6=1` 时）、daed 片段与 wing.db 信号。输出示例：
 
 ```text
 == 验证链路 A: dnsmasq / https-dns-proxy / nftables ==
@@ -318,7 +357,7 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh check
 [ ok ] 无失效的 127.0.0.1#50xx 残留
 [ ok ] dns_redirect=0（无 DNSMASQ HIJACK 重复劫持）
 ...
-结果: 28 通过, 0 失败, 1 警告, 2 跳过
+结果: 32 通过, 0 失败, 1 警告, 2 跳过
 ```
 
 有任何 FAIL 时按提示排查，常见定位方法见 [docs/troubleshooting.md](docs/troubleshooting.md)。
@@ -378,8 +417,11 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh clean --purge   # 全部删除
 **Q: 域名还是被解析到错误 IP？**
 确认 daed DNS 已全部 DoH 化（情况 E）——GUI 中不能再有 `udp://...:53` / `tcp+udp://...:53` 上游。
 
+**Q: 时不时「国内能上、外网全挂」，重启 daed 有时能恢复？**
+典型根因是 WAN 上有「有名无实」的 IPv6：daed 用 v6 拨 DoH 上游超时 → 国外域名 SERVFAIL → 节点域名也解析不出 → 代理整体下线。重启只是复位状态。用 `ping -6 2400:3200::1` 验证 v6 是否真通；不通则在配置中设 `DISABLE_IPV6="1"` 重跑 `install`（见 [整机禁用 IPv6](#整机禁用-ipv6disable_ipv6可选) 与 [troubleshooting 情况 F](docs/troubleshooting.md)）。
+
 **Q: 我的宽带有 IPv6，但 VPS 节点的 IPv6 不稳定，应该怎么办？**
-默认生成的 daed DNS 片段包含 `ipversion_prefer: 4`，并且全局节点检测清单只保留 IPv4 检测。注意：该设置只影响 daed 处理的 DNS；脚本的 LAN `dnsmasq → https-dns-proxy` 链路仍需单独处理 AAAA，或在 LAN 防火墙层禁用 IPv6。详见 [troubleshooting 情况 F](docs/troubleshooting.md)。
+默认生成的 daed DNS 片段包含 `ipversion_prefer: 4`，并且全局节点检测清单只保留 IPv4 检测。注意：该设置只影响 daed 处理的 DNS，且实测部分版本并不会过滤 AAAA；脚本的 LAN `dnsmasq → https-dns-proxy` 链路返回的 AAAA 也需单独处理。最彻底的做法是 `DISABLE_IPV6="1"` 整机关闭 IPv6。详见 [troubleshooting 情况 F](docs/troubleshooting.md)。
 
 更多见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
@@ -390,7 +432,7 @@ sh /root/openwrt-dns-daed/openwrt-dns-daed.sh clean --purge   # 全部删除
 1. **强 53 / 拒 853 ≠ 封锁所有 DoH**：客户端仍可能自行通过 443 端口访问第三方 DoH。canary 域名能约束部分系统/浏览器行为，但不等于全网封锁。
 2. **daed 部分需要手动粘贴一次**：本脚本不直接写 `wing.db`，DNS/Routing 需在 GUI 中粘贴脚本生成的片段（这也是 daed 官方推荐方式）。
 3. **`force_dns` 端口重定向**只覆盖 `LAN_IFACES` 指定的接口（默认 `lan`）。
-4. 默认 `ipversion_prefer: 4` 只影响 daed DNS，不会自动过滤 `https-dns-proxy` 链路返回的 AAAA。
+4. 默认 `ipversion_prefer: 4` 只影响 daed DNS，不会自动过滤 `https-dns-proxy` 链路返回的 AAAA（部分 daed 版本对自身处理的查询也不过滤）；需要硬保证时用 `DISABLE_IPV6="1"`。
 5. https-dns-proxy 未来版本的 UCI 选项如有变化，`check` 会以 FAIL 形式提示差异，便于及时发现。
 
 ---

@@ -11,3 +11,13 @@ config dnsmasq
 	list doh_server '127.0.0.1#5054'
 	list doh_server '127.0.0.1#5055'
 	list doh_backup_server '127.0.0.1#5054'
+
+config dhcp 'lan'
+	option interface 'lan'
+	option start '100'
+	option limit '150'
+	option leasetime '12h'
+	option dhcpv6 'hybrid'
+	option ra 'hybrid'
+	option ra_slaac '1'
+	option ndp 'hybrid'

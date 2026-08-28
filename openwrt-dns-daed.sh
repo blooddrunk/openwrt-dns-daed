@@ -12,7 +12,8 @@
 #      geosite:cn -> AliDNS DoH ；其余 -> Google DoH
 #
 #  本脚本负责：备份、dnsmasq 清理与加固、https-dns-proxy 配置、防火墙核对、
-#  daed DNS/Routing 配置片段生成与只读校验、连通性验证、回退、清理。
+#  daed DNS/Routing 配置片段生成与只读校验、连通性验证、回退、清理，
+#  以及可选的整机 IPv6 禁用（DISABLE_IPV6=1，见 README「整机禁用 IPv6」）。
 #
 #  重要边界：daed 的配置保存在 /etc/daed/wing.db（SQLite），按约定不直接写库。
 #  脚本只生成可粘贴进 daed GUI 的片段文件，并对 wing.db 做只读信号检查。
@@ -39,7 +40,7 @@
 # =============================================================================
 
 SCRIPT_NAME="openwrt-dns-daed"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 # -----------------------------------------------------------------------------
 # 0. 路径常量（部分可被环境变量覆盖，便于沙箱测试）
@@ -91,6 +92,13 @@ DIRECT_INTERNAL_DOMAINS="example.corp example.lan"
 PREMIUM_GEOSITES="anthropic paypal"
 # 需强制走代理组的国内域名（在 geosite:cn 直连规则之前生效）
 PROXY_CN_DOMAINS="xiaohongshu.com xhscdn.com xhscdn.net nga.cn 178.com ngabbs.com ngacn.cc xueqiu.com imedao.com"
+# 整机禁用 IPv6（可选，默认关闭）。适合上游拿不到 IPv6 PD 前缀、或 IPv6 实际
+# 不通的网络：daed 会优先用 v6 拨 DoH 上游，v6 不通会导致国外域名 DNS 间歇性
+# SERVFAIL，并连累节点域名解析与代理整体可用性（详见 README「整机禁用 IPv6」）。
+# =1 时 install 会停用 WAN/WAN6 的 IPv6、删除 ULA 前缀、关闭 LAN 的 RA/DHCPv6/NDP。
+DISABLE_IPV6="0"
+# apply_ipv6_disable 检测到实际变更时置 1，用于决定是否 reload network
+IPV6_NET_RELOAD=0
 TEST_DOMAIN="example.com"
 MAX_BACKUPS="8"
 DAED_EXTRA_DIR="${EXTRA_DIR_DEFAULT}"
@@ -258,6 +266,10 @@ print_fail_hints() {
         info "· UCI/防火墙类不符    -> 直接重跑 install（幂等，会按目标值重写并重启服务）"
         matched=1
     fi
+    if printf '%s' "$RES_FAIL_TEXT" | grep -qF "IPv6:"; then
+        info "· IPv6 禁用未生效     -> 重跑 install（幂等）；仍失败: uci show network / uci show dhcp 对照 README「整机禁用 IPv6」"
+        matched=1
+    fi
     if printf '%s' "$RES_FAIL_TEXT" | grep -qF ":53 无监听"; then
         info "· :53 无监听          -> /etc/init.d/dnsmasq restart；仍失败: logread -e dnsmasq | tail -n 20"
         matched=1
@@ -386,6 +398,14 @@ PROXY_CN_DOMAINS="xiaohongshu.com nga.cn xueqiu.com"
 # ---- 其他 ----
 # check 时用于连通性测试的域名
 TEST_DOMAIN="example.com"
+# 可选：整机禁用 IPv6。适合上游拿不到 IPv6 PD 前缀、或 IPv6 实际不通的网络。
+# daed 会优先用 v6 拨 DoH 上游，v6 不通会导致国外域名 DNS 间歇性 SERVFAIL、
+# 节点域名解析失败，进而代理整体不可用（详见 README「整机禁用 IPv6」与
+# docs/troubleshooting.md 情况 F）。
+# =1 时 install 将: network.wan.ipv6=0、network.wan6.proto=none、删除 ULA 前缀、
+# dhcp.lan 的 ra/dhcpv6/ndp=disabled，并在有变更时自动 reload network。
+# 恢复: rollback（network 配置随备份一起还原）。
+DISABLE_IPV6="0"
 # 备份保留份数（回退时用）
 MAX_BACKUPS="8"
 # 自定义 Routing 追加片段目录（可选）。目录下若存在
@@ -416,6 +436,7 @@ load_conf() {
     [ -f "$CONF_FILE" ] && . "$CONF_FILE"
     [ -n "$LAN_IFACES" ]     || LAN_IFACES="lan"
     [ -n "$HDP_LISTEN_PORT" ] || HDP_LISTEN_PORT="5053"
+    [ "$DISABLE_IPV6" = "1" ] || DISABLE_IPV6="0"
     return 0
 }
 
@@ -440,9 +461,14 @@ do_backup() { # do_backup <原因>
     if [ -f "${CONFIG_DIR}/https-dns-proxy" ] && have_uci; then
         uci export https-dns-proxy > "${dir}/https-dns-proxy.uci" 2>/dev/null
     fi
+    if [ -f "${CONFIG_DIR}/network" ] && have_uci; then
+        uci export network > "${dir}/network.uci" 2>/dev/null
+    fi
     [ -f "${CONFIG_DIR}/dhcp" ] && cp "${CONFIG_DIR}/dhcp" "${dir}/dhcp.raw"
     [ -f "${CONFIG_DIR}/https-dns-proxy" ] && \
         cp "${CONFIG_DIR}/https-dns-proxy" "${dir}/https-dns-proxy.raw"
+    [ -f "${CONFIG_DIR}/network" ] && \
+        cp "${CONFIG_DIR}/network" "${dir}/network.raw"
     db=$(daed_wing_db)
     if [ -f "$db" ]; then
         if cp "$db" "${dir}/wing.db" 2>/dev/null; then
@@ -592,6 +618,88 @@ apply_hdp() {
 
     uci commit https-dns-proxy
     log "https-dns-proxy 配置已提交"
+}
+
+apply_ipv6_disable() { # DISABLE_IPV6=1 时禁用整机 IPv6（WAN 获取、ULA、LAN RA/DHCPv6/NDP）
+    section "禁用整机 IPv6（DISABLE_IPV6=1）"
+    have_uci || die "未找到 uci 命令，无法禁用 IPv6"
+    IPV6_NET_RELOAD=0
+
+    # WAN：v4 接口（dhcp/pppoe 等）不再获取 IPv6
+    if uci -q show network.wan >/dev/null 2>&1; then
+        if [ "$(uci_get_value network.wan.ipv6)" != "0" ]; then
+            log "停用 network.wan 的 IPv6（ipv6=0）"
+            uci set network.wan.ipv6='0'
+            IPV6_NET_RELOAD=1
+        else
+            info "network.wan.ipv6 已为 0"
+        fi
+    else
+        warn "未找到 network.wan，跳过 WAN IPv6 停用（自定义 WAN 接口名请手动处理）"
+    fi
+
+    # WAN6：独立 v6 接口置为 none（原配置可经 rollback 还原）
+    if uci -q show network.wan6 >/dev/null 2>&1; then
+        if [ "$(uci_get_value network.wan6.proto)" != "none" ]; then
+            log "停用 network.wan6（proto=none）"
+            uci set network.wan6.proto='none'
+            IPV6_NET_RELOAD=1
+        else
+            info "network.wan6.proto 已为 none"
+        fi
+    else
+        info "无 network.wan6 接口，跳过"
+    fi
+
+    # ULA：删除全局 ULA 前缀（br-lan 不再持有 IPv6 地址/RDNSS）
+    if [ -n "$(uci_get_value network.globals.ula_prefix)" ]; then
+        log "删除 network.globals.ula_prefix"
+        uci -q delete network.globals.ula_prefix
+        IPV6_NET_RELOAD=1
+    else
+        info "ULA 前缀未设置"
+    fi
+
+    # LAN：关闭 RA / DHCPv6 / NDP（客户端不再获得 IPv6 地址与 RDNSS）
+    local ifc opt
+    for ifc in $LAN_IFACES; do
+        if ! uci -q show "dhcp.${ifc}" >/dev/null 2>&1; then
+            warn "未找到 dhcp.${ifc}，跳过该接口的 RA/DHCPv6/NDP 关闭"
+            continue
+        fi
+        for opt in ra dhcpv6 ndp; do
+            if [ "$(uci_get_value "dhcp.${ifc}.${opt}")" != "disabled" ]; then
+                uci set "dhcp.${ifc}.${opt}=disabled"
+                IPV6_NET_RELOAD=1
+            fi
+        done
+        log "已确保 dhcp.${ifc} 的 ra/dhcpv6/ndp=disabled"
+    done
+
+    uci commit network
+    uci commit dhcp
+    if [ "$IPV6_NET_RELOAD" = "1" ]; then
+        info "IPv6 相关配置有变更，稍后将重载 network 并重启 odhcpd"
+        info "注意: 客户端已缓存的 ULA/RA 最长约 30 分钟自然老化，重连 Wi-Fi/网线可立即生效"
+    else
+        info "IPv6 禁用配置均已就位，无需重载 network"
+    fi
+}
+
+reload_network_stack() { # 应用网络层配置变更（IPv6 禁用 / rollback 还原 network 时使用）
+    if [ -x "${INIT_DIR}/network" ]; then
+        if "${INIT_DIR}/network" reload >/dev/null 2>&1; then
+            log "已重载网络服务（network reload）"
+        else
+            warn "network reload 返回非零，请手动执行 ${INIT_DIR}/network reload 查看输出"
+        fi
+    else
+        warn "缺少 init 脚本 network，跳过网络重载（请手动 ${INIT_DIR}/network reload）"
+    fi
+    if [ -x "${INIT_DIR}/odhcpd" ]; then
+        svc_restart odhcpd || true
+    fi
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1029,6 +1137,45 @@ verify_snippets() {
     fi
 }
 
+verify_ipv6() {
+    if [ "$DISABLE_IPV6" != "1" ]; then
+        res SKIP "IPv6 禁用未启用（DISABLE_IPV6=0；若上游 IPv6 不通/无 PD，建议开启，见 README「整机禁用 IPv6」）"
+        return 0
+    fi
+    have_uci || { res SKIP "无 uci 命令，跳过 IPv6 禁用检查"; return 0; }
+    local ifc opt v ok
+    if uci -q show network.wan >/dev/null 2>&1; then
+        v=$(uci_get_value network.wan.ipv6)
+        [ "$v" = "0" ] && res PASS "IPv6: network.wan.ipv6=0" \
+            || res FAIL "IPv6: network.wan.ipv6=${v:-未设置}（应为 0；重跑 install 修正）"
+    else
+        res SKIP "IPv6: 无 network.wan 接口，跳过该项检查"
+    fi
+    if uci -q show network.wan6 >/dev/null 2>&1; then
+        v=$(uci_get_value network.wan6.proto)
+        [ "$v" = "none" ] && res PASS "IPv6: network.wan6.proto=none" \
+            || res FAIL "IPv6: network.wan6.proto=${v:-未设置}（应为 none；重跑 install 修正）"
+    else
+        res SKIP "IPv6: 无 network.wan6 接口"
+    fi
+    v=$(uci_get_value network.globals.ula_prefix)
+    [ -z "$v" ] && res PASS "IPv6: ULA 前缀未设置" \
+        || res FAIL "IPv6: ULA 前缀仍为 ${v}（应删除；重跑 install 修正）"
+    for ifc in $LAN_IFACES; do
+        if ! uci -q show "dhcp.${ifc}" >/dev/null 2>&1; then
+            res SKIP "IPv6: 无 dhcp.${ifc} 节，跳过"
+            continue
+        fi
+        ok=1
+        for opt in ra dhcpv6 ndp; do
+            [ "$(uci_get_value "dhcp.${ifc}.${opt}")" = "disabled" ] || ok=0
+        done
+        [ "$ok" = "1" ] && res PASS "IPv6: dhcp.${ifc} 的 ra/dhcpv6/ndp=disabled" \
+            || res FAIL "IPv6: dhcp.${ifc} 的 ra/dhcpv6/ndp 未全部 disabled（重跑 install 修正）"
+    done
+    return 0
+}
+
 verify_layer_a() {
     section "验证链路 A: dnsmasq / https-dns-proxy / nftables"
     verify_dnsmasq_uci
@@ -1037,6 +1184,7 @@ verify_layer_a() {
     verify_ports
     verify_nft
     verify_resolution
+    verify_ipv6
 }
 
 verify_layer_b() {
@@ -1116,6 +1264,12 @@ cmd_install() {
     do_backup "install"
     apply_dnsmasq
     apply_hdp
+    if [ "$DISABLE_IPV6" = "1" ]; then
+        apply_ipv6_disable
+    fi
+    if [ "$DISABLE_IPV6" = "1" ] && [ "$IPV6_NET_RELOAD" = "1" ]; then
+        reload_network_stack
+    fi
     section "重启服务（顺序: dnsmasq -> https-dns-proxy）"
     svc_restart dnsmasq
     svc_restart https-dns-proxy
@@ -1200,6 +1354,16 @@ cmd_rollback() {
     else
         warn "备份中无 https-dns-proxy.uci，跳过"
     fi
+    local net_restored=0
+    if [ -f "${dir}/network.uci" ]; then
+        uci import network < "${dir}/network.uci" && uci commit network \
+            && log "已恢复 network 配置" \
+            || die "恢复 network 配置失败" \
+                "备份文件可能损坏。检查: cat ${dir}/network.uci；可手动执行 uci import network < 该文件 查看具体报错"
+        net_restored=1
+    else
+        info "备份中无 network.uci（旧版本备份），跳过"
+    fi
 
     if [ "$FLAG_WITH_DAED" = "1" ]; then
         section "恢复 daed 数据库"
@@ -1216,6 +1380,9 @@ cmd_rollback() {
     fi
 
     section "重启服务"
+    if [ "$net_restored" = "1" ]; then
+        reload_network_stack
+    fi
     svc_restart dnsmasq
     svc_exists https-dns-proxy && svc_restart https-dns-proxy
     log "回退完成。建议运行 check 验证: $(basename "$0") check"

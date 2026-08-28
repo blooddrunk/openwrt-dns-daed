@@ -9,7 +9,7 @@
 |---|---|
 | `bin/uci` | OpenWrt `uci` 命令的最小可测替身：实现 `show/get/set/add/add_list/del_list/delete/import/export/commit`，状态持久化于 `UCI_STATE` 指定的文件，变更同时记录到 `UCI_CALLS` |
 | `fixtures/` | 种子与样本：脏/净状态下的 nft 规则集、netstat 输出、wing.db 文本替身、uci 配置种子 |
-| `run_tests.sh` | 测试驱动：搭建沙箱（含 nft/netstat/nslookup/init.d 替身）并执行 T0–T16 场景 |
+| `run_tests.sh` | 测试驱动：搭建沙箱（含 nft/netstat/nslookup/init.d 替身）并执行 T0–T17 场景 |
 
 ## 运行
 
@@ -39,6 +39,7 @@ sh tests/run_tests.sh
 - **T14** TUN 设备缺失（`DD_TUN_DEV` 指向不存在路径）时 `check` 报 `tun-missing` FAIL，输出 kmod-tun 修复速查；恢复后对照通过
 - **T15** `update` 遇死链时 `die` 输出「原因/解决」提示
 - **T16** 服务重启失败时原样展示服务输出，并解码 `tun-missing` 为 kmod-tun 处理建议
+- **T17** `DISABLE_IPV6=1` 时 `install` 禁用整机 IPv6（wan.ipv6=0、wan6=none、删 ULA 前缀、ra/dhcpv6/ndp=disabled、network reload + odhcpd 重启、备份含 network.uci）；`check` 报 IPv6 各项 PASS；重复 install 不再 reload（幂等）；`rollback` 连同 network 配置还原（含 `network.seed` fixture 与 `network`/`odhcpd` init.d 替身）
 
 ## 局限
 

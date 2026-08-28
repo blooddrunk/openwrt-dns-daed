@@ -52,6 +52,14 @@ PROXY_CN_DOMAINS="xiaohongshu.com nga.cn xueqiu.com"
 # ---- 其他 ----
 # check 时用于连通性测试的域名
 TEST_DOMAIN="example.com"
+# 可选：整机禁用 IPv6。适合上游拿不到 IPv6 PD 前缀、或 IPv6 实际不通的网络。
+# daed 会优先用 v6 拨 DoH 上游，v6 不通会导致国外域名 DNS 间歇性 SERVFAIL、
+# 节点域名解析失败，进而代理整体不可用（详见 README「整机禁用 IPv6」与
+# docs/troubleshooting.md 情况 F）。
+# =1 时 install 将: network.wan.ipv6=0、network.wan6.proto=none、删除 ULA 前缀、
+# dhcp.lan 的 ra/dhcpv6/ndp=disabled，并在有变更时自动 reload network。
+# 恢复: rollback（network 配置随备份一起还原）。
+DISABLE_IPV6="0"
 # 备份保留份数（回退时用）
 MAX_BACKUPS="8"
 # 自定义 Routing 追加片段目录（可选）。目录下若存在
