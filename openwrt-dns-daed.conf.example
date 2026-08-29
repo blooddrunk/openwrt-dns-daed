@@ -9,15 +9,17 @@
 # ---- LAN / https-dns-proxy ----
 # force_dns 生效的接口（通常为 lan；多个用空格分隔）
 LAN_IFACES="lan"
-# DoH 上游与启动引导 DNS（bootstrap 仅用于解析 DoH 域名本身）
-HDP_RESOLVER_URL="https://dns.alidns.com/dns-query"
+# DoH 上游默认 IP 形式（无需解析 DoH 域名，避免依赖 dnsmasq/hdp/daed 链路）；
+# 如改回域名形式，bootstrap 才会用于解析 DoH 域名本身
+HDP_RESOLVER_URL="https://223.5.5.5/dns-query"
 HDP_BOOTSTRAP_DNS="223.5.5.5,223.6.6.6"
 HDP_LISTEN_ADDR="127.0.0.1"
 HDP_LISTEN_PORT="5053"
 
 # ---- daed DNS（粘贴到 daed GUI 的 DNS 标签页）----
-DAED_DNS_CN_URL="https://dns.alidns.com/dns-query"
-DAED_DNS_FALLBACK_URL="https://dns.google/dns-query"
+DAED_DNS_CN_URL="https://223.5.5.5/dns-query"
+# 1.1.1.1:443 国内直连受干扰，务必保留 Routing 中 dip(1.1.1.1/32...) -> premium 钉住规则
+DAED_DNS_FALLBACK_URL="https://1.1.1.1/dns-query"
 # 默认只返回 IPv4，适合 VPS 节点 IPv6 不稳定的网络；留空则允许 IPv6
 DAED_DNS_IPVERSION_PREFER="4"
 

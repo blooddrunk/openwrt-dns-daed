@@ -68,7 +68,7 @@ pname(
 
 ```text
 错误示例:  udp://223.5.5.5:53        tcp+udp://8.8.8.8:53
-正确:      https://dns.alidns.com/dns-query   https://dns.google/dns-query
+正确:      https://223.5.5.5/dns-query   https://1.1.1.1/dns-query
 ```
 
 `openwrt-dns-daed.sh check` 会对 `wing.db`（含 `-wal`）做只读信号检查并提示；daed 的最新配置在 WAL 未 checkpoint 时只存在于 `wing.db-wal` 中，脚本两份都查。

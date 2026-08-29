@@ -162,8 +162,8 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `LAN_IFACES` | `lan` | force_dns 生效的接口，多个用空格分隔 |
-| `HDP_RESOLVER_URL` | `https://dns.alidns.com/dns-query` | dnsmasq 上游 DoH 解析器 |
-| `HDP_BOOTSTRAP_DNS` | `223.5.5.5,223.6.6.6` | 引导 DNS，仅用于启动时解析 DoH 域名本身 |
+| `HDP_RESOLVER_URL` | `https://223.5.5.5/dns-query` | dnsmasq 上游 DoH 解析器。默认 IP 形式：无需解析 DoH 域名，避免依赖 dnsmasq/hdp/daed 链路（见下方「DoH 上游为什么用 IP」） |
+| `HDP_BOOTSTRAP_DNS` | `223.5.5.5,223.6.6.6` | 引导 DNS，仅在 `HDP_RESOLVER_URL` 为域名形式时用于解析 DoH 域名本身 |
 | `HDP_LISTEN_ADDR` | `127.0.0.1` | https-dns-proxy 监听地址 |
 | `HDP_LISTEN_PORT` | `5053` | https-dns-proxy 监听端口 |
 
@@ -171,8 +171,8 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DAED_DNS_CN_URL` | `https://dns.alidns.com/dns-query` | 中国域名（geosite:cn）使用的 DoH |
-| `DAED_DNS_FALLBACK_URL` | `https://dns.google/dns-query` | 其余域名使用的 DoH |
+| `DAED_DNS_CN_URL` | `https://223.5.5.5/dns-query` | 中国域名（geosite:cn）使用的 DoH（IP 形式） |
+| `DAED_DNS_FALLBACK_URL` | `https://1.1.1.1/dns-query` | 其余域名使用的 DoH（IP 形式；需配合 Routing 中 `dip(...) -> premium` 钉住规则从节点出口，直连国内会被干扰） |
 | `DAED_DNS_IPVERSION_PREFER` | `4` | daed DNS 遇到同时存在 A/AAAA 的域名时仅响应 A；留空则省略该设置并允许 IPv6 |
 | `DAED_GROUP_PROXY` | `proxy` | 普通代理组名，**必须与 daed 中实际组名一致** |
 | `DAED_GROUP_PREMIUM` | `premium` | 高级代理组名，同上 |
@@ -180,6 +180,20 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 | `DIRECT_INTERNAL_DOMAINS` | 占位符 | 内部/私有域名（公司内网域名等）直连；`geosite:private` 自动追加 |
 | `PREMIUM_GEOSITES` | `anthropic paypal` | 固定走 premium 组的 geosite（不含前缀）；留空则不生成该规则 |
 | `PROXY_CN_DOMAINS` | 小红书/NGA/雪球等 | 需强制走代理组的国内域名（在 geosite:cn 直连之前生效） |
+
+### DoH 上游为什么用 IP 形式（v1.2.2 起默认）
+
+域名形式的 DoH 上游（`https://dns.alidns.com/...`）在连接前要先解析 DoH 域名本身，而这条解析链路恰好是最脆弱的一环，并会形成**循环依赖**：
+
+```text
+daed 域名形式 DoH ──要解析──▶ dnsmasq ──▶ https-dns-proxy 的 DoH ──经 daed 转发──▶ 出网
+        ▲                                                          │
+        └───────────── daed 转发面卡死时整环皆死 ────────────────────┘
+```
+
+实测（2026-08 网关策略丢包事件）：节点拨号风暴把 daed 用户态转发卡死后，域名形式上游与 https-dns-proxy 一起失效，表现为「国内网站也打不开」；把上游改为 `https://223.5.5.5/dns-query` 后 daed 用自带 mark 的 socket 直接拨号、不再依赖解析链路，故障期间国内 DNS 保持可用。AliDNS 与 Cloudflare 的证书均包含对应 IP 的 SAN，`https://223.5.5.5/dns-query` / `https://1.1.1.1/dns-query` 合法可用。
+
+代价与注意：失去上游域名多 IP 容灾（对 223.5.5.5/1.1.1.1 这类 anycast 可忽略）；`1.1.1.1:443` 直连国内会被干扰，**必须**保留 Routing 中 `dip(1.1.1.1/32, 1.0.0.1/32, ...) -> premium` 钉住规则（见「fallback DoH 上游固定走 Reality 节点」）。
 
 ### 其他
 
@@ -280,8 +294,9 @@ function operator(proxies) {
 **做法**：在 `fallback: proxy` 之前，把发往 DoH 上游的流量指向只含 Reality/TCP 节点的分组。支持 IP 与域名两种匹配写法，推荐**双写互为补充**：
 
 ```text
-# dip 兜底 cloudflare-dns.com 的固定 A 记录：不依赖嗅探，SNI-less 流量也能命中
-dip(104.16.248.249/32, 104.16.249.249/32) -> premium
+# dip 打底：fallback DoH 默认上游 1.1.1.1/1.0.0.1（IP 形式直连无需解析），
+# 以及 cloudflare-dns.com 的固定 A 记录（覆盖域名形式上游与 SNI-less 流量）
+dip(1.1.1.1/32, 1.0.0.1/32, 104.16.248.249/32, 104.16.249.249/32) -> premium
 # domain 覆盖 A 记录漂移与其它带该 SNI 的流量（如浏览器自带 DoH）
 domain(suffix: cloudflare-dns.com) -> premium
 ```
@@ -293,7 +308,7 @@ domain(suffix: cloudflare-dns.com) -> premium
 | 命中确定性 | 确定，不依赖任何机制 | 依赖 SNI 嗅探对 daed 自身流量生效（`dial_mode: ip` 时嗅探整体关闭，domain 规则将失效） |
 | 抗 A 记录变化 | 差（IP 写死，可 `nslookup cloudflare-dns.com 223.5.5.5` 复核） | 好 |
 | 覆盖面 | 仅列出的 IP | 所有带该 SNI 的流量 |
-| 无 SNI 的流量（如直连 `https://1.1.1.1` 的 DoH） | 能命中（需要时把列表扩为 `..., 1.1.1.1/32, 1.0.0.1/32`） | 匹配不到 |
+| 无 SNI 的流量（如直连 `https://1.1.1.1` 的 DoH） | 能命中（默认示例已含 `1.1.1.1/32, 1.0.0.1/32`） | 匹配不到 |
 
 背景知识：dae 的 `domain()` 域名来源有两个——daed 处理过的 DNS 应答（IP→域名回溯）与 SNI 嗅探。对「daed 自身的 DoH 上游」这条流量，前者不适用（`cloudflare-dns.com` 由 daed 内部引导解析、未经客户端查询，不进 IP→域名缓存），只能依赖后者；这就是推荐 `dip` 打底、`domain` 补充的原因。
 
@@ -345,13 +360,13 @@ daed 的配置保存在 `/etc/daed/wing.db`（SQLite 数据库）。按约定**�
 dns {
     ipversion_prefer: 4
     upstream {
-        alidns: 'https://dns.alidns.com/dns-query'
-        googledns: 'https://dns.google/dns-query'
+        alidns: 'https://223.5.5.5/dns-query'
+        cloudflaredns: 'https://1.1.1.1/dns-query'
     }
     routing {
         request {
             qname(geosite:cn) -> alidns
-            fallback: googledns
+            fallback: cloudflaredns
         }
     }
 }

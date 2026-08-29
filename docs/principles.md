@@ -148,7 +148,7 @@ IPv6:  不配置 TCP/UDP 节点检测地址
 bootstrap_dns = 223.5.5.5,223.6.6.6
 ```
 
-它只在 https-dns-proxy 启动阶段用于解析 `dns.alidns.com` 这个 DoH 域名本身；之后的实际查询全部走 HTTPS/443。只保留 IPv4 引导即可。
+它只在 https-dns-proxy 启动阶段用于解析 DoH 域名本身；之后的实际查询全部走 HTTPS/443。只保留 IPv4 引导即可。注意：v1.2.2 起 `HDP_RESOLVER_URL` 默认为 IP 形式（`https://223.5.5.5/dns-query`），此时无需解析 DoH 域名、bootstrap 不被使用；仅当你改回域名形式时它才生效。
 
 不要把它与 daed 全局页面的“引导解析器 / 备用解析器”混为一谈：前者是链路 A 的 `HDP_BOOTSTRAP_DNS`，后者只是 daed 自身启动或系统解析不可用时的辅助解析器。
 

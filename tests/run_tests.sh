@@ -232,7 +232,9 @@ assert_grep "Routing: premium 组" "$RT" "geosite:anthropic"
 assert_grep "Routing: 内部域名" "$RT" "suffix: corp.example"
 assert_grep "Routing: geosite:cn 直连" "$RT" "domain(geosite:cn) -> direct"
 assert_grep "DNS: CN 分流" "$DNSN" "qname(geosite:cn) -> alidns"
-assert_grep "DNS: DoH 上游" "$DNSN" "https://dns.google/dns-query"
+assert_grep "DNS: DoH CN 上游(IP)" "$DNSN" "https://223.5.5.5/dns-query"
+assert_grep "DNS: DoH fallback 上游(IP)" "$DNSN" "https://1.1.1.1/dns-query"
+assert_grep "DNS: fallback 上游键名" "$DNSN" "fallback: cloudflaredns"
 assert_grep "DNS: IPv4 优先" "$DNSN" "ipversion_prefer: 4"
 GLOBAL="$SB/work/daed/daed-global-settings.txt"
 assert_file "daed 全局设置清单" "$GLOBAL"
@@ -436,9 +438,9 @@ cat > "$SB/etc/daed/wing.db-wal" <<'EOF'
 WAL frame 1: historical revision (daed default plaintext DNS)
 dns: upstream { alidns: 'udp://223.5.5.5:53' googledns: 'tcp+udp://8.8.8.8:53' }
 WAL frame 2: current revision (DoH snippet pasted)
-dns: upstream alidns='https://dns.alidns.com/dns-query' googledns='https://dns.google/dns-query'
+dns: upstream alidns='https://223.5.5.5/dns-query' cloudflaredns='https://1.1.1.1/dns-query'
 dns: ipversion_prefer: 4
-dns: routing qname(geosite:cn) -> alidns, fallback: googledns
+dns: routing qname(geosite:cn) -> alidns, fallback: cloudflaredns
 routing: dip(203.0.113.10/32) && l4proto(tcp) && dport(33973) -> must_direct
 routing: dip(203.0.113.10/32) && l4proto(udp) && dport(50757) -> must_direct
 routing: dip(198.51.100.20/32) && l4proto(tcp) && dport(12142) -> must_direct
@@ -458,7 +460,7 @@ assert_not_grep "must_direct WARN 不出现" "$SB/last.out" "未见 must_direct"
 echo "== T19: -wal 中明文为最新写入（DoH 后改回明文）应报 FAIL =="
 cat > "$SB/etc/daed/wing.db-wal" <<'EOF'
 WAL frame 1: old DoH revision
-dns: upstream alidns='https://dns.alidns.com/dns-query' googledns='https://dns.google/dns-query'
+dns: upstream alidns='https://223.5.5.5/dns-query' cloudflaredns='https://1.1.1.1/dns-query'
 routing: dip(203.0.113.10/32) && l4proto(tcp) && dport(33973) -> must_direct
 WAL frame 2: reverted to plaintext (latest write)
 dns: upstream { alidns: 'udp://223.5.5.5:53' googledns: 'tcp+udp://8.8.8.8:53' }

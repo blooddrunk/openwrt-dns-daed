@@ -40,7 +40,7 @@
 # =============================================================================
 
 SCRIPT_NAME="openwrt-dns-daed"
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 
 # -----------------------------------------------------------------------------
 # 0. 路径常量（部分可被环境变量覆盖，便于沙箱测试）
@@ -65,12 +65,15 @@ DAED_INSTALLER_URL_DEFAULT="https://raw.githubusercontent.com/kenzok8/openwrt-da
 # 1. 可调配置默认值（可被 /etc/openwrt-dns-daed.conf 覆盖；模板见 conf 内嵌 heredoc）
 # -----------------------------------------------------------------------------
 LAN_IFACES="lan"
-HDP_RESOLVER_URL="https://dns.alidns.com/dns-query"
+# DoH 上游推荐直接用 IP 形式（AliDNS 证书含 223.5.5.5 的 IP SAN）：
+# 域名形式需要先解析 DoH 域名本身，解析链路（dnsmasq→hdp→daed relay）
+# 恰好是最容易先失效的一环，会形成 daed DNS ↔ hdp 的循环依赖。
+HDP_RESOLVER_URL="https://223.5.5.5/dns-query"
 HDP_BOOTSTRAP_DNS="223.5.5.5,223.6.6.6"
 HDP_LISTEN_ADDR="127.0.0.1"
 HDP_LISTEN_PORT="5053"
-DAED_DNS_CN_URL="https://dns.alidns.com/dns-query"
-DAED_DNS_FALLBACK_URL="https://dns.google/dns-query"
+DAED_DNS_CN_URL="https://223.5.5.5/dns-query"
+DAED_DNS_FALLBACK_URL="https://1.1.1.1/dns-query"
 # IPv4-only profile for networks whose proxy nodes do not reliably support IPv6.
 # Leave empty to omit the setting and allow daed to return IPv6 answers.
 DAED_DNS_IPVERSION_PREFER="4"
@@ -407,15 +410,17 @@ gen_conf_template() { # gen_conf_template <dest>
 # ---- LAN / https-dns-proxy ----
 # force_dns 生效的接口（通常为 lan；多个用空格分隔）
 LAN_IFACES="lan"
-# DoH 上游与启动引导 DNS（bootstrap 仅用于解析 DoH 域名本身）
-HDP_RESOLVER_URL="https://dns.alidns.com/dns-query"
+# DoH 上游默认 IP 形式（无需解析 DoH 域名，避免依赖 dnsmasq/hdp/daed 链路）；
+# 如改回域名形式，bootstrap 才会用于解析 DoH 域名本身
+HDP_RESOLVER_URL="https://223.5.5.5/dns-query"
 HDP_BOOTSTRAP_DNS="223.5.5.5,223.6.6.6"
 HDP_LISTEN_ADDR="127.0.0.1"
 HDP_LISTEN_PORT="5053"
 
 # ---- daed DNS（粘贴到 daed GUI 的 DNS 标签页）----
-DAED_DNS_CN_URL="https://dns.alidns.com/dns-query"
-DAED_DNS_FALLBACK_URL="https://dns.google/dns-query"
+DAED_DNS_CN_URL="https://223.5.5.5/dns-query"
+# 1.1.1.1:443 国内直连受干扰，务必保留 Routing 中 dip(1.1.1.1/32...) -> premium 钉住规则
+DAED_DNS_FALLBACK_URL="https://1.1.1.1/dns-query"
 # 默认只返回 IPv4，适合 VPS 节点 IPv6 不稳定的网络；留空则允许 IPv6
 DAED_DNS_IPVERSION_PREFER="4"
 
@@ -855,19 +860,21 @@ gen_daed_snippets() {
 # ============================================================
 # 由 ${SCRIPT_NAME} v${SCRIPT_VERSION} 生成于 $(date '+%Y-%m-%d %H:%M:%S')
 # 用法: daed GUI -> 配置 -> DNS 标签页，整体替换为以下内容后保存
-# 目标: 中国域名走 AliDNS DoH，其余走 Google DoH（全部加密，无 :53 明文）
+# 目标: 中国域名走 AliDNS DoH，其余走 Cloudflare DoH（全部加密、IP 直连，无 :53 明文）
 # IP 版本偏好: ${DAED_DNS_IPVERSION_PREFER:-未设置（允许 IPv6）}
+# 注意: 上游为 IP 形式时无需解析 DoH 域名；fallback(1.1.1.1) 需配合
+#       Routing 中 dip(...) -> premium 钉住规则从节点出口，直连国内会被干扰
 # ============================================================
 dns {
 ${daed_dns_ipversion_line}    upstream {
         alidns: '${DAED_DNS_CN_URL}'
-        googledns: '${DAED_DNS_FALLBACK_URL}'
+        cloudflaredns: '${DAED_DNS_FALLBACK_URL}'
     }
 
     routing {
         request {
             qname(geosite:cn) -> alidns
-            fallback: googledns
+            fallback: cloudflaredns
         }
     }
 }
