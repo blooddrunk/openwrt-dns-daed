@@ -341,6 +341,46 @@ grep "DNS forward to upstream failed" /var/log/daed/daed.log | tail
 dip(203.0.113.99/32) && l4proto(tcp) && dport(8443) -> must_direct
 ```
 
+### 自建 Headscale 场景：控制面/DERP 域名按出口位置定向（2026-10-27 实战）
+
+路由器同时是自建 headscale tailnet 的节点时，`tailscaled` 的控制面
+（`https://<login-server>/`）与 DERP 中继（`:443`）流量默认命中
+`fallback: proxy`，**走哪个节点完全由分组的延迟策略决定**。实测问题：
+分组自动选中的节点出口在圣何塞（SJC），导致——
+
+- DERP Tokyo 中继绕行 CN→SJC→TYO，经中继的流量 ~680ms（本应 ~100ms）；
+- 控制面请求 ~1.4s（SJC→FRA 绕行）。
+
+**修法**：为两个控制域名各建一个**单节点分组**（分组策略随意，
+单节点即锁定出口），让流量"出口就在目标 VPS 本机"：
+
+1. daed GUI → 配置 → 分组：新建分组 `tailscale-ctrl`（仅含
+   `nosla-hysteria2`）、`tailscale-derp`（仅含 `bitsflow-hysteria2`，
+   订阅里出口在 bitsflow VPS 本机的节点）；
+2. `routing-extra.dae` 加两条（放在 CN 规则之前的插入点已由脚本保证）：
+
+```text
+domain(suffix: "hs-nosla.haoqi90.top") -> tailscale-ctrl
+domain(suffix: "hs-bitsflow.haoqi90.top") -> tailscale-derp
+```
+
+（第二条域名按实际 DERP 域名替换；多 tailnet 各加一套。）
+
+3. 重新生成/粘贴 Routing 并重启 daed。
+
+**验证**：
+
+```sh
+curl -sk -o /dev/null -w '%{http_code} %{time_total}s\n' https://hs-nosla.haoqi90.top/health   # 200, ~0.4s(出口本地)
+tailscale netcheck    # tokyo/nosla 延迟应明显下降(经本机出口节点)
+```
+
+> 注意 daed 的数据面是 **eBPF**：`nft list tables` 里永远看不到 dae
+> 表，别用 nft 判断它是否在接管——看 `/var/log/daed/daed.log` 的
+> `Routing match` 行。另：daed UI 里"停止再启动"可能只拉起 Web 面板、
+> 核心未加载（无任何 eBPF/Routing 日志、代理全断），此时用
+> `/etc/init.d/daed restart` 完整重启。
+
 ---
 
 ## daed 的手动步骤（GUI）
