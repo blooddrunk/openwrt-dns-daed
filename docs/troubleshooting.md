@@ -73,6 +73,14 @@ pname(
 
 `openwrt-dns-daed.sh check` 会对 `wing.db`（含 `-wal`）做只读信号检查并提示；daed 的最新配置在 WAL 未 checkpoint 时只存在于 `wing.db-wal` 中，脚本两份都查。
 
+**若 check 报「疑似仍是明文 :53 上游」但 GUI 明明已是 DoH**：多半是主库里的**历史行残影**——SQLite 的自由页会保留旧行版本（如 daed 初装的默认 `udp://223.5.5.5:53`），外部工具 checkpoint/覆盖过 wing.db 后残影落入主库，触发脚本「主库含明文即明文」的兜底判定。确认当前行干净（以 GUI 显示为准）后，可停 daed 对主库做一次 `VACUUM` 重建清掉自由页残影，再 `check` 复测：
+
+```sh
+/etc/init.d/daed stop
+sqlite3 /etc/daed/wing.db 'VACUUM;'   # 无 sqlite3 时可用任意 SQLite 工具处理副本后回传
+/etc/init.d/daed start
+```
+
 ## 情况 F：宽带有 IPv6，但 VPS 节点 IPv6 不稳定
 
 如果节点本身没有 IPv6、IPv6 线路没有优化，或节点的 IPv6 质量不稳定，按以下方式设置 daed：
@@ -126,13 +134,13 @@ WARN DNS forward to upstream failed dialer=xx-hysteria2 ... network=tcp+4
 两个推论：
 
 1. 此时的报错 `http3: parsing frame failed: timeout: no recent network activity` 来自 **Hysteria2 隧道的 QUIC 层**，不是 DoH3（dae 中 `https://` 本来就是 TCP/h2，`h3://` 才是 DoH3），GUI 里没有「DoH3 改 DoH」的开关可动；
-2. fallback DNS 的可用性 = 所选节点的可用性。Hysteria2（UDP）受 QoS 抖动时 DoH 跟着抖。若日志中 `DNS forward to upstream failed` 集中在某 `-hysteria2` dialer 上，可在 Routing 的 `fallback: proxy` 之前把 Cloudflare DoH 的 IP 固定到 Reality（TCP）节点组：
+2. fallback DNS 的可用性 = 所选节点的可用性。Hysteria2（UDP）受 QoS 抖动时 DoH 跟着抖。若日志中 `DNS forward to upstream failed` 集中在某 `-hysteria2` dialer 上，可在 Routing 的 `fallback: proxy` 之前把 Cloudflare DoH 的 IP 固定到专用承载组：
 
    ```text
-   dip(104.16.248.249/32, 104.16.249.249/32) -> premium
+   dip(104.16.248.249/32, 104.16.249.249/32) -> doh
    ```
 
-   （`premium` 需为只含 Reality/TCP 节点的组；`cloudflare-dns.com` 的 A 记录长期为这两个地址，可用 `nslookup cloudflare-dns.com 223.5.5.5` 复核。也可再加一条 `domain(suffix: cloudflare-dns.com) -> premium` 覆盖 A 记录变化——注意这条流量只能靠 SNI 嗅探命中 domain 规则，`dip` 是确定性兜底，详见 README「fallback DoH 上游固定走 Reality 节点」。）
+   （钉住组**建议**只含 Reality/TCP 节点且**必须跨 VPS**——这是 2026-10-30 实战修订：DoH 钉住组若只有一台 VPS 的节点（hy2+reality 同入口 IP），VPS 抖动时整组全灭、全部国外域名 SERVFAIL，而其他分组正常。只有一台 premium VPS 时另建跨 VPS `doh` 组，`premium` 留给按出口质量选路的规则。`cloudflare-dns.com` 的 A 记录长期为这两个地址，可用 `nslookup cloudflare-dns.com 223.5.5.5` 复核。也可再加一条 `domain(suffix: cloudflare-dns.com) -> doh` 覆盖 A 记录变化——注意这条流量只能靠 SNI 嗅探命中 domain 规则，`dip` 是确定性兜底，详见 README「fallback DoH 上游固定走 Reality 节点」。）
 
 ## 情况 G：开启 daed 后，v2rayN 真连接延迟 `-1 ms`
 
@@ -204,4 +212,28 @@ logread -e daed | tail -n 30
 - **恢复配置失败（rollback）**：备份文件损坏或不兼容，按提示手动 `uci import` 查看具体报错。
 
 `check`/`install` 结束若有 FAIL，会输出「FAIL 修复速查」段落，逐条给出一行式修复命令。
+
+## 情况 L：国外域名解析 SERVFAIL，日志大量 `no proper dialer for DNS upstream`
+
+```text
+WARN DNS ingress fast path failed; sending SERVFAIL response dst=192.168.10.1:53
+     error=no proper dialer for DNS upstream: https://1.1.1.1:443/dns-query ...
+INFO Group has no dialer alive group=premium network=tcp4
+```
+
+含义：daed 自身到 fallback DoH 上游的连接按 Routing 钉在某个分组上，而该分组当前**没有一个存活节点**，于是所有国外域名（`fallback: cloudflaredns`）都返回 SERVFAIL。国内域名（alidns）不受影响，`proxy` 分组也可能一切正常——「分组里明明有可用节点，外网却全挂」就是这个形态。
+
+排查：
+
+```sh
+grep -E "Group has no dialer alive|Marking dialer as unavailable" /var/log/daed/daed.log | tail
+```
+
+常见根因与修法：
+
+1. **DoH 钉住组只有一台 VPS 的节点**（hy2 + reality 共享同一入口 IP），VPS 抖动时整组全灭。修法：钉住组改为**跨 VPS** 的 Reality/TCP 节点集合（新建 `doh` 组，规则右侧 `-> doh`），见 README「fallback DoH 上游固定走 Reality 节点」。
+2. 钉住组含 Hysteria2 且被 `min` 策略常态选中：UDP QoS 抖动导致 DoH 间歇失败（`http3:` 报错）。修法同上，DoH 承载组建议只放 Reality/TCP。
+3. 全部节点被 `Marking dialer as unavailable due to persistent proxy IP failures` 连坐（上游网络事件/DNS 瘫痪连累节点域名解析）。先解决网络/解析（见情况 F），节点恢复可用后分组自动回血。
+
+改完分组/规则后用 `/etc/init.d/daed restart` 完整重启（daed UI 里的停止再启动可能只拉起面板、核心不加载）。
 

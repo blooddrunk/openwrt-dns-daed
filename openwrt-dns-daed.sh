@@ -419,7 +419,8 @@ HDP_LISTEN_PORT="5053"
 
 # ---- daed DNS（粘贴到 daed GUI 的 DNS 标签页）----
 DAED_DNS_CN_URL="https://223.5.5.5/dns-query"
-# 1.1.1.1:443 国内直连受干扰，务必保留 Routing 中 dip(1.1.1.1/32...) -> premium 钉住规则
+# 1.1.1.1:443 国内直连受干扰，务必保留 Routing 中 dip(1.1.1.1/32...) 钉住规则
+# （钉住组建议用跨 VPS 的 Reality/TCP 专用组，如 doh；不要钉在单台 VPS 的分组上）
 DAED_DNS_FALLBACK_URL="https://1.1.1.1/dns-query"
 # 默认只返回 IPv4，适合 VPS 节点 IPv6 不稳定的网络；留空则允许 IPv6
 DAED_DNS_IPVERSION_PREFER="4"

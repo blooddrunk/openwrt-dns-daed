@@ -13,3 +13,6 @@ local*.conf
 
 # 本地排障手册（含公司域名/内网信息，绝不提交）
 *.local.md
+
+# 浏览器自动化调试产物
+.playwright-cli/

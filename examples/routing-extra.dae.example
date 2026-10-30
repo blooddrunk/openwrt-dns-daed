@@ -1,0 +1,54 @@
+# ============================================================
+# routing-extra.dae 脱敏模板
+# 用法: 复制到路由器 /etc/openwrt-dns-daed.d/routing-extra.dae
+#       并把占位符替换为实际值（IP 用 RFC 5737 占位，域名用 example.top）
+#
+# install 生成 daed-routing.dae 时会把本文件整体插入到
+# 「节点 endpoint 规则之后、组播/私网/CN 规则之前」。
+# 本文件中的规则目标均不与 CN/私网规则重叠，位置语义安全。
+#
+# 依赖的 daed 分组（须先在 GUI 创建，名称一致）:
+#   doh              跨 VPS 的 Reality 节点集合（fallback DoH 专用承载）
+#   tailscale-ctrl   出口在 headscale 控制面 VPS 本机的节点
+#   tailscale-derp   出口在 DERP VPS 本机的节点
+# ============================================================
+
+# ---- Hysteria2 回程精确直连（节点入口 UDP sport，install 不会生成，须在此维护）----
+sip(203.0.113.10/32) && l4proto(udp) && sport(51237) -> must_direct
+sip(203.0.113.20/32) && l4proto(udp) && sport(47777) -> must_direct
+sip(203.0.113.30/32) && l4proto(udp) && sport(36143) -> must_direct
+
+# ---- STUN (UDP 3478) 直连：含 LAN 客户端与路由器自身的 NAT 穿越 ----
+l4proto(udp) && dport(3478) -> direct
+
+# ---- Headscale 控制面 / DERP：出口锁定在目标 VPS 本机 ----
+domain(suffix: hs-nosla.example.top) -> tailscale-ctrl
+domain(suffix: hs-bitsflow.example.top) -> tailscale-derp
+
+# ---- 自建 Cloudflare Access 应用走 premium 出口 ----
+# （须位于下方 cloudflareaccess.com 的 must_direct 之前）
+domain(full: access.example.top) -> premium
+
+# ---- Google / Gemini 显式代理，优先于 geosite:cn 和 geoip:cn ----
+domain(
+    geosite:google-deepmind,
+    geosite:google
+) -> proxy
+
+# ---- fallback DoH 上游钉到跨 VPS 的 doh 组 ----
+# 不再押 premium 的单台 VPS（2026-10-30 实战修订）。
+# dip 打底：1.1.1.1/1.0.0.1 为 IP 形式拨号、无 SNI，domain 规则匹配不到；
+# 104.16.248.249/249 为 cloudflare-dns.com 的固定 A 记录兜底
+dip(1.1.1.1/32, 1.0.0.1/32, 104.16.248.249/32, 104.16.249.249/32) -> doh
+# domain 覆盖 A 记录漂移与其它带该 SNI 的流量（如浏览器自带 DoH）
+domain(suffix: cloudflare-dns.com) -> doh
+
+# ---- Cloudflare Tunnel：cloudflared 隧道边缘与 Access 校验直连 ----
+# （自建 Access 域名已在上方先命中 premium，不受影响）
+domain(
+    suffix: argotunnel.com,
+    suffix: cftunnel.com,
+    suffix: cloudflareaccess.com
+) -> must_direct
+dip(198.41.192.0/24, 198.41.200.0/24) && l4proto(tcp) && dport(7844) -> must_direct
+dip(198.41.192.0/24, 198.41.200.0/24) && l4proto(udp) && dport(7844) -> must_direct

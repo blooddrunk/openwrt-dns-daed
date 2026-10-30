@@ -107,13 +107,14 @@ sh /tmp/odd.sh install
 ```text
 1. 在路由器上运行 install（首次会自动生成 /etc/openwrt-dns-daed.conf 模板）
 2. 编辑 /etc/openwrt-dns-daed.conf —— 填入你的真实节点 endpoint、内网域名等
-3. 再次运行 install —— 用你的配置重新生成 daed 片段与 GUI 设置清单
-4. 打开 daed GUI，先按 `daed-global-settings.txt` 设置全局/节点检测
-5. 把生成的 DNS / Routing 片段粘贴进对应标签页，保存并重启 daed
-6. 运行 check 复查全部信号
+3. （推荐）放置 /etc/openwrt-dns-daed.d/routing-extra.dae 附加规则（模板见 examples/）
+4. 再次运行 install —— 用你的配置重新生成 daed 片段与 GUI 设置清单
+5. 打开 daed GUI：创建分组（proxy/premium/doh…）→ 设置全局/节点检测
+   → 粘贴 DNS / Routing 片段
+6. /etc/init.d/daed restart 重启（勿只用 UI 内的停止/启动），运行 check 复查
 ```
 
-配置文件**一旦生成永不被覆盖**，升级脚本也不影响你的自定义内容。
+配置文件**一旦生成永不被覆盖**，升级脚本也不影响你的自定义内容。完整重放手册（含分组速查表、check_tolerance 建议与无 GUI 直改库附录）见 [docs/reapply-runbook.md](docs/reapply-runbook.md)。
 
 ---
 
@@ -172,7 +173,7 @@ sh /tmp/odd.sh install --install-missing --restart-daed
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `DAED_DNS_CN_URL` | `https://223.5.5.5/dns-query` | 中国域名（geosite:cn）使用的 DoH（IP 形式） |
-| `DAED_DNS_FALLBACK_URL` | `https://1.1.1.1/dns-query` | 其余域名使用的 DoH（IP 形式；需配合 Routing 中 `dip(...) -> premium` 钉住规则从节点出口，直连国内会被干扰） |
+| `DAED_DNS_FALLBACK_URL` | `https://1.1.1.1/dns-query` | 其余域名使用的 DoH（IP 形式；需配合 Routing 中 `dip(...) -> <DoH 专用组>` 钉住规则从节点出口，直连国内会被干扰，且钉住组要跨 VPS） |
 | `DAED_DNS_IPVERSION_PREFER` | `4` | daed DNS 遇到同时存在 A/AAAA 的域名时仅响应 A；留空则省略该设置并允许 IPv6 |
 | `DAED_GROUP_PROXY` | `proxy` | 普通代理组名，**必须与 daed 中实际组名一致** |
 | `DAED_GROUP_PREMIUM` | `premium` | 高级代理组名，同上 |
@@ -193,7 +194,7 @@ daed 域名形式 DoH ──要解析──▶ dnsmasq ──▶ https-dns-proxy
 
 实测（2026-08 网关策略丢包事件）：节点拨号风暴把 daed 用户态转发卡死后，域名形式上游与 https-dns-proxy 一起失效，表现为「国内网站也打不开」；把上游改为 `https://223.5.5.5/dns-query` 后 daed 用自带 mark 的 socket 直接拨号、不再依赖解析链路，故障期间国内 DNS 保持可用。AliDNS 与 Cloudflare 的证书均包含对应 IP 的 SAN，`https://223.5.5.5/dns-query` / `https://1.1.1.1/dns-query` 合法可用。
 
-代价与注意：失去上游域名多 IP 容灾（对 223.5.5.5/1.1.1.1 这类 anycast 可忽略）；`1.1.1.1:443` 直连国内会被干扰，**必须**保留 Routing 中 `dip(1.1.1.1/32, 1.0.0.1/32, ...) -> premium` 钉住规则（见「fallback DoH 上游固定走 Reality 节点」）。
+代价与注意：失去上游域名多 IP 容灾（对 223.5.5.5/1.1.1.1 这类 anycast 可忽略）；`1.1.1.1:443` 直连国内会被干扰，**必须**保留 Routing 中 `dip(1.1.1.1/32, 1.0.0.1/32, ...) -> <DoH 专用组>` 钉住规则，且该组要**跨 VPS**（见「fallback DoH 上游固定走 Reality 节点」）。
 
 ### 其他
 
@@ -291,14 +292,14 @@ function operator(proxies) {
 
 **背景**：daed 自身对 fallback DoH 上游（如 cloudflare-dns.com）的查询也会被 dae 按 Routing 分流，通常命中 `fallback: proxy` 从节点出口发出——这也是国外域名 DNS 答案不被污染的原因。代价是 fallback DNS 的可用性 = 所选节点的可用性：当分组策略（如 `min_moving_avg`）选中 Hysteria2 节点、而其 UDP/QUIC 隧道受 QoS 抖动时，DoH 会跟着间歇失败（日志特征：`DNS forward to upstream failed dialer=xx-hysteria2 ... connect error: http3: ...`，该 `http3` 报错来自 Hysteria2 隧道层而非 DoH3）。
 
-**做法**：在 `fallback: proxy` 之前，把发往 DoH 上游的流量指向只含 Reality/TCP 节点的分组。支持 IP 与域名两种匹配写法，推荐**双写互为补充**：
+**做法**：在 `fallback: proxy` 之前，把发往 DoH 上游的流量指向一个**专用 DoH 承载组**（建议：跨 VPS 的 Reality/TCP 节点集合，下例命名为 `doh`）。支持 IP 与域名两种匹配写法，推荐**双写互为补充**：
 
 ```text
 # dip 打底：fallback DoH 默认上游 1.1.1.1/1.0.0.1（IP 形式直连无需解析），
 # 以及 cloudflare-dns.com 的固定 A 记录（覆盖域名形式上游与 SNI-less 流量）
-dip(1.1.1.1/32, 1.0.0.1/32, 104.16.248.249/32, 104.16.249.249/32) -> premium
+dip(1.1.1.1/32, 1.0.0.1/32, 104.16.248.249/32, 104.16.249.249/32) -> doh
 # domain 覆盖 A 记录漂移与其它带该 SNI 的流量（如浏览器自带 DoH）
-domain(suffix: cloudflare-dns.com) -> premium
+domain(suffix: cloudflare-dns.com) -> doh
 ```
 
 两种写法的取舍：
@@ -312,7 +313,17 @@ domain(suffix: cloudflare-dns.com) -> premium
 
 背景知识：dae 的 `domain()` 域名来源有两个——daed 处理过的 DNS 应答（IP→域名回溯）与 SNI 嗅探。对「daed 自身的 DoH 上游」这条流量，前者不适用（`cloudflare-dns.com` 由 daed 内部引导解析、未经客户端查询，不进 IP→域名缓存），只能依赖后者；这就是推荐 `dip` 打底、`domain` 补充的原因。
 
-前提：目标组（示例为 `premium`）只含 Reality/TCP 节点；若混有 Hysteria2，请先新建一个纯 Reality 组并替换规则右侧。规则只影响发往 DoH 专用地址/带该 SNI 的流量，不影响其他 Cloudflare 服务。
+前提与取舍（2026-10-30 实战修订，原「必须纯 Reality/TCP」降级为建议）：
+
+1. **钉住组必须跨 VPS（硬要求，比协议选择更重要）**。DoH 钉住组的可用性 = 全部国外域名解析的可用性：组内节点若同属一台 VPS（哪怕同时有 Reality + Hysteria2 两种入口，共享同一入口 IP），VPS 抖动时整组全灭——日志特征 `Group has no dialer alive group=xxx` → `no proper dialer for DNS upstream` → 所有国外域名 SERVFAIL，而 `proxy` 等其他分组可能一切正常，表现为「分组里明明有可用节点，外网却全挂」。
+2. **协议以 Reality/TCP 为宜（建议，非硬性）**。DoH 查询是极小的请求/响应流量，看重稳定而非吞吐：Hysteria2（UDP/QUIC + Brutal）的抗丢包吞吐优势帮不上小包交互，反而会把 UDP QoS 抖动传导给 DoH（`http3:` 报错即来自 hy2 隧道层），且低延迟的 hy2 常被 `min` 策略优先选中、变成常态承载。
+3. **Hysteria2 的真正用武之地是大流量承载分组**（如 `proxy`）：丢包高/被限速的线路上吞吐通常优于 TCP 系代理，也避免了 TCP-in-TCP 恶化。按角色分工即可，不必全组追求纯 Reality。
+4. 只有一台 "premium" 线路 VPS 时：`premium` 组保留该 VPS 全部节点（hy2 + reality 协议多样性反而是优点），继续服务**按出口质量选路**的规则（anthropic/paypal 等）；另建跨 VPS 的 `doh` 组承载上面两条 DoH 规则。规则只影响发往 DoH 专用地址/带该 SNI 的流量，不影响其他 Cloudflare 服务。
+
+**关于「严格优先 premium、全挂才 fallback、恢复自动回归」**：dae 核心支持 `filter: name(节点) [add_latency: -500ms]` 延迟偏移（官方定位就是 latency-based failover——给 premium 节点负偏移，健康时永远最低必被选中，劣化/死亡自动让位，恢复自动回归）。但截至 2026-10 实测，daed 面板与 wing.db 均不支持该字段（分组策略枚举仅 `fixed/min/min_avg10/min_moving_avg/random`）。daed 下的两个折中：
+
+- 合并 premium 与备用 Reality 节点为一个组，`min` 策略 + `check_tolerance`（如 50ms）粘性：premium 线路健康时通常延迟最低被选中，劣化自动切换；但平延迟时无保证，且恢复后需比现任节点快出 tolerance 才回归——对 IP 敏感服务意味着偶发换出口，需自行权衡；
+- 维持 premium 独占（本仓库默认）：严格保证出口，代价是单 VPS 故障期间这些服务不可用。
 
 两种落地方式：
 
@@ -340,6 +351,8 @@ grep "DNS forward to upstream failed" /var/log/daed/daed.log | tail
 # routing-extra.dae
 dip(203.0.113.99/32) && l4proto(tcp) && dport(8443) -> must_direct
 ```
+
+一份现成的脱敏模板（含 fallback DoH 钉到 `doh` 组、Hysteria2 回程 `sip`、STUN、headscale 锁出口、Cloudflare Tunnel 等实战附加规则）见 [examples/routing-extra.dae.example](examples/routing-extra.dae.example)。把整套方案重放到新路由器的完整步骤见 [docs/reapply-runbook.md](docs/reapply-runbook.md)。
 
 ### 自建 Headscale 场景：控制面/DERP 域名按出口位置定向（2026-10-27 实战）
 
@@ -385,14 +398,23 @@ tailscale netcheck    # tokyo/nosla 延迟应明显下降(经本机出口节点)
 
 ## daed 的手动步骤（GUI）
 
-daed 的配置保存在 `/etc/daed/wing.db`（SQLite 数据库）。按约定**本脚本绝不直接写库**，只生成片段并做只读检查；全局/节点检测设置需要按清单手动填写，DNS/Routing 需要在 GUI 中粘贴：
+daed 的配置保存在 `/etc/daed/wing.db`（SQLite 数据库）。按约定**本脚本绝不直接写库**，只生成片段并做只读检查；分组、全局/节点检测、DNS/Routing 都需要在 GUI 中手工完成一次（完整重放手册见 [docs/reapply-runbook.md](docs/reapply-runbook.md)）：
 
 1. 打开 daed 面板（LuCI → 服务 → daede，或独立面板地址）
-2. **配置 → 全局 / 节点检测**：参照 `/root/openwrt-dns-daed/daed/daed-global-settings.txt` 逐项填写
-3. **配置 → DNS**：用 `/root/openwrt-dns-daed/daed/daed-dns.dae` 的内容整体替换并保存
-4. **配置 → Routing**：用 `/root/openwrt-dns-daed/daed/daed-routing.dae` 的内容整体替换并保存
-5. 重启 daed（GUI 内重启，或 `/etc/init.d/daed restart`）
-6. 运行 `check` 复查
+2. **配置 → 分组**：按下表创建（`doh` 组的设计依据见「fallback DoH 上游固定走 Reality 节点」；节点命名建议带协议，`doh` 组用 `reality` 正则过滤依赖它）
+
+   | 分组 | 成员 | 策略 | 用途 |
+   |---|---|---|---|
+   | `proxy`（同 `DAED_GROUP_PROXY`） | 主订阅全量（hy2+reality 混合无妨） | `min` | 日常代理 |
+   | `premium`（同 `DAED_GROUP_PREMIUM`） | premium 订阅全量（单 VPS 保持独占） | `min` | 出口质量敏感规则 |
+   | `doh` | 每台 VPS 的订阅各加一个 + `reality` 过滤 | `min` | fallback DoH 跨 VPS 承载 |
+   | `tailscale-ctrl` / `tailscale-derp` | 出口在对应 VPS 本机的节点 | `min` | headscale 锁出口（可选） |
+
+3. **配置 → 全局 / 节点检测**：参照 `/root/openwrt-dns-daed/daed/daed-global-settings.txt` 逐项填写；`check_tolerance` 建议 50ms（0 容差会在几 ms 差距间反复换节点）
+4. **配置 → DNS**：用 `/root/openwrt-dns-daed/daed/daed-dns.dae` 的内容整体替换并保存
+5. **配置 → Routing**：用 `/root/openwrt-dns-daed/daed/daed-routing.dae` 的内容整体替换并保存
+6. 重启 daed：`/etc/init.d/daed restart`（daed UI 里的停止/启动可能只拉起面板、核心不加载）
+7. 运行 `check` 复查
 
 生成的 DNS / Routing 片段长这样（按你的配置自动生成）：
 
@@ -584,7 +606,10 @@ openwrt-dns-daed/
 ├── openwrt-dns-daed.conf.example  # 配置模板（与脚本内嵌模板一致）
 ├── docs/
 │   ├── principles.md              # 架构与原理（为什么这样配）
+│   ├── reapply-runbook.md         # 新路由器重放整套方案的 runbook
 │   └── troubleshooting.md         # 常见故障快速定位
+├── examples/
+│   └── routing-extra.dae.example  # routing-extra.dae 脱敏模板（doh 钉住/回程/隧道等）
 ├── tests/
 │   ├── bin/uci                    # uci 命令最小替身（状态持久化）
 │   ├── fixtures/                  # 脏/净状态种子、nft/netstat/wing.db 样本
