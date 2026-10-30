@@ -99,7 +99,27 @@ grep "Health check will only verify" /var/log/daed/daed.log | tail -1   # outbou
 
 ## 7. 附录：无 GUI 时的直改库流程（高级，慎用）
 
+> **先检查管理通道是否依赖 daed（2026-10-30 实战教训）**：若这台路由器只能经 tailnet/自建 DERP 访问，而 DERP 流量本身又由 daed 分组承载（`tailscale-ctrl` 等），则**停 daed = 自断管理通道**。在这种设备上绝不能用「SSH 里跑一长串 stop→改→start」的裸流程——连接中途断开就会把 daed 永远停在 stopped，只能现场断电。安全做法：把整个变更写成一个**自愈式一次性脚本**放到路由器上，用 `nohup` 脱离会话执行；并在动手前预置一条兜底延时启动（见下）。
+
 远程自动化或无法访问 GUI 时可直改 `wing.db`（本流程 2026-10-30 实战验证）。脚本本身仍不写库，此为人工操作：
+
+0. **自愈式执行模板**（管理通道依赖 daed 的设备必用；其他设备也建议用，等价于崩溃安全）：
+
+   ```sh
+   cat > /tmp/fix-daed.sh <<'EOS'
+   #!/bin/sh
+   # 幂等：new 库在则换入；无论如何最后都把 daed 拉起
+   if [ -f /tmp/wing.db.new ]; then
+       rm -f /etc/daed/wing.db-wal /etc/daed/wing.db-shm
+       mv /tmp/wing.db.new /etc/daed/wing.db
+       chmod 640 /etc/daed/wing.db
+   fi
+   /etc/init.d/daed restart
+   EOS
+   # 兜底：即使主脚本意外中断，90 秒后也强制拉起 daed
+   nohup sh -c 'sleep 90; /etc/init.d/daed start' >/dev/null 2>&1 &
+   nohup sh /tmp/fix-daed.sh >/tmp/fix-daed.log 2>&1 &
+   ```
 
 1. 备份三件套：`cp -a /etc/daed/wing.db* <备份目录>/`；
 2. `/etc/init.d/daed stop`；拉回 db+`-wal`+`-shm`，用 SQLite 工具改：
