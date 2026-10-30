@@ -864,7 +864,8 @@ gen_daed_snippets() {
 # 目标: 中国域名走 AliDNS DoH，其余走 Cloudflare DoH（全部加密、IP 直连，无 :53 明文）
 # IP 版本偏好: ${DAED_DNS_IPVERSION_PREFER:-未设置（允许 IPv6）}
 # 注意: 上游为 IP 形式时无需解析 DoH 域名；fallback(1.1.1.1) 需配合
-#       Routing 中 dip(...) -> premium 钉住规则从节点出口，直连国内会被干扰
+#       Routing 中 dip(...) 钉住规则（建议跨 VPS Reality 专用组，如 doh）
+#       从节点出口，直连国内会被干扰
 # ============================================================
 dns {
 ${daed_dns_ipversion_line}    upstream {
